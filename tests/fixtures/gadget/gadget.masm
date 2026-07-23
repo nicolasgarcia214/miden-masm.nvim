@@ -1,0 +1,5 @@
+#! Single-file account-component fixture.
+
+pub proc run
+    push.1 drop
+end

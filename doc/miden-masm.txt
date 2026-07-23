@@ -1,0 +1,143 @@
+*miden-masm.txt*    Miden Assembly support: highlighting and code navigation
+
+Author:  Nicolas Garcia
+License: MIT
+
+==============================================================================
+CONTENTS                                                          *miden-masm*
+
+  1. Introduction ................................. |miden-masm-introduction|
+  2. Mappings ......................................... |miden-masm-mappings|
+  3. Commands ......................................... |miden-masm-commands|
+  4. Configuration ...................................... |miden-masm-config|
+  5. Name resolution ................................ |miden-masm-resolution|
+  6. Limitations .................................... |miden-masm-limitations|
+
+==============================================================================
+1. INTRODUCTION                                      *miden-masm-introduction*
+
+miden-masm.nvim provides Miden Assembly (`.masm`) support:
+
+- tree-sitter highlighting, indentation, folds and textobjects (requires
+  nvim-treesitter and the `masm` parser; run `:TSInstall masm`). Once the
+  parser is installed these activate automatically per buffer: the ftplugin
+  calls `vim.treesitter.start()` and sets 'indentexpr'/'foldexpr', since
+  nvim-treesitter's main branch enables nothing by itself. Opt out with
+  |g:masm_no_treesitter|.
+- go-to-definition, references and document symbols, implemented with plain
+  text analysis of the project: no language server and no parser required
+
+Neovim ships a `masm` filetype for Microsoft Macro Assembler; this plugin
+corrects its settings (comments, indentation, matchit words) for Miden in
+`after/ftplugin/masm.lua`.
+
+Run `:checkhealth masm` to verify the installation.
+
+==============================================================================
+2. MAPPINGS                                              *miden-masm-mappings*
+
+All mappings are buffer-local to `masm` buffers.
+
+                                                    *miden-masm-gd* *miden-masm-CTRL-]*
+gd / CTRL-]        Jump to the definition of the name under the cursor:
+                   procedures (`exec.`/`call.`/`procref.` targets), kernel
+                   procedures (`syscall.` targets), constants and types.
+                   On a module qualifier, a `use` path segment or a
+                   `pub mod` name, jump to the module's file instead.
+                   Implemented via 'tagfunc', so the full tag machinery
+                   applies: CTRL-T to go back, |:tag|, |:tjump|, etc.
+
+                                                              *miden-masm-grr*
+grr                Find references to the symbol under the cursor across the
+                   project and populate the quickfix list, definition first.
+                   Every candidate usage is resolved to its definition, so
+                   usages through renamed imports and re-export chains are
+                   included. On a module qualifier, list the `use` statements
+                   importing that module instead.
+
+                                                               *miden-masm-gO*
+gO                 List the buffer's definitions (procs, consts, types,
+                   submodules, `begin` entrypoint) in the location list.
+
+==============================================================================
+3. COMMANDS                                              *miden-masm-commands*
+
+                                                            *:MasmRebuildIndex*
+:MasmRebuildIndex  Drop the cached project index and resolution caches. The
+                   index rebuilds on the next jump. Use after adding,
+                   deleting or moving `.masm` files or `miden-project.toml`
+                   manifests, or after changing |g:masm_goto|. Plain edits to
+                   existing files do not need this: definition positions are
+                   re-read whenever a file's mtime changes.
+
+==============================================================================
+4. CONFIGURATION                                           *miden-masm-config*
+
+                                                                 *g:masm_goto*
+g:masm_goto        Optional table: >lua
+                     vim.g.masm_goto = {
+                       extra_roots = { "~/work/miden-vm" },
+                       ignore_dirs = { "target", "node_modules" },
+                     }
+<
+                   extra_roots: additional directories scanned for
+                   `miden-project.toml` libraries. Point at a miden-vm
+                   checkout to resolve `std::..` and `miden::core::..`.
+
+                   ignore_dirs: directory names never descended into while
+                   indexing (replaces the default list). Hidden directories
+                   are always skipped.
+
+                                                   *g:masm_no_default_mappings*
+g:masm_no_default_mappings
+                   When true, the plugin defines no keymaps; call
+                   `require("masm.goto").references()` and
+                   `.document_symbols()` from your own mappings. 'tagfunc'
+                   is still set, so CTRL-] and |:tag| keep working.
+
+                                                        *g:masm_no_treesitter*
+g:masm_no_treesitter
+                   When true, the ftplugin does not call
+                   `vim.treesitter.start()` and leaves 'indentexpr',
+                   'foldmethod' and 'foldexpr' alone. Use it when your
+                   config wires tree-sitter features itself.
+
+==============================================================================
+5. NAME RESOLUTION                                     *miden-masm-resolution*
+
+The resolver mirrors the Miden assembler's project model:
+
+- A library is a directory holding `miden-project.toml` whose `[lib]` table
+  gives `namespace` (e.g. "miden::standards") and optionally `path` to the
+  root module file. Submodule `a::b` lives at `<root>/a/b.masm` or
+  `<root>/a/b/mod.masm`. Account components are single-file libraries named
+  after their directory. The `kind = "kernel"` library is what `syscall.`
+  targets resolve against.
+- `use miden::foo::bar` imports module `bar`; `use .. as x` renames it;
+  `use {sym, orig as alias} from <module>` imports symbols directly and may
+  span multiple lines.
+- `pub use` re-export chains are followed, tracking renames at every hop,
+  until the underlying `proc`/`const`/`type` definition is found.
+
+The index roots at the git root (or the outermost directory containing a
+`miden-project.toml`) and is cached for the session.
+
+==============================================================================
+6. LIMITATIONS                                        *miden-masm-limitations*
+
+- The pinned tree-sitter grammar predates the current dialect: `use {..}
+  from ..`, `pub mod` and `use .. as ..` parse as ERROR nodes, which mainly
+  affects import headers (and `mod.masm` files). Navigation is text-based
+  for exactly this reason and is unaffected.
+- Resolution is by convention, not by running the assembler; unresolvable
+  names report a reason instead of guessing.
+- Re-export chains are followed up to 5 hops; deeper chains report "not
+  found". Cycles are detected and fail cleanly.
+- References read other files from disk; unsaved changes in buffers other
+  than the current one are not seen.
+- The index walk and references scan run synchronously; very large trees
+  (e.g. a full miden-vm checkout in `extra_roots`) slow the first jump and
+  every references scan proportionally.
+- No completion, diagnostics, hover or rename.
+
+vim:tw=78:ts=8:noet:ft=help:norl:

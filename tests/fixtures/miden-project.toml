@@ -1,0 +1,4 @@
+# Workspace marker so the fixture tree is indexable even without a .git root
+# (top_dir falls back to the outermost directory holding a miden-project.toml).
+[workspace]
+members = ["core_lib", "std_lib", "kernel", "gadget"]

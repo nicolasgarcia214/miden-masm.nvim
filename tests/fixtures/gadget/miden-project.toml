@@ -1,0 +1,5 @@
+# Account components have no [lib] path; the root file is named after the
+# directory (gadget.masm), matching the layout in real Miden projects.
+[lib]
+kind      = "account-component"
+namespace = "fix::components::gadget"

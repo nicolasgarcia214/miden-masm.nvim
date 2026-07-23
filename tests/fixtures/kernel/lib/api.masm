@@ -1,0 +1,5 @@
+#! Fixture kernel API. `syscall.` targets resolve against this file.
+
+pub proc exec_kernel_proc
+    caller
+end

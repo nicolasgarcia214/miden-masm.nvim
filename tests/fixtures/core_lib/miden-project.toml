@@ -1,0 +1,7 @@
+[package]
+name    = "fix-core"
+version = "0.1.0"
+
+[lib]
+namespace = "fix::core"
+path      = "mod.masm"

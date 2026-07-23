@@ -1,0 +1,10 @@
+[package]
+name    = "fix-standards"
+version = "0.1.0"
+
+[lib]
+namespace = "fix::standards"
+path      = "mod.masm"
+
+[dependencies]
+fix-core = { path = "../core_lib" }

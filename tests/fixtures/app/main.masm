@@ -1,0 +1,30 @@
+#! Fixture program exercising every import form the resolver handles.
+
+use fix::core::math
+use fix::core::math as m
+use fix::standards::wrappers
+use fix::components::gadget
+use {MAX_VALUE} from fix::core::math
+use {
+    PAIR_SIZE,
+    Pair as PairAlias,
+} from fix::core::types
+
+const LOCAL_LIMIT = 100
+
+proc local_helper
+    push.LOCAL_LIMIT add
+end
+
+begin
+    push.1 push.2
+    exec.math::add_checked
+    exec.m::mul_checked
+    exec.local_helper
+    push.MAX_VALUE drop
+    push.PAIR_SIZE drop
+    push.wrappers::LIMIT drop
+    exec.wrappers::double
+    exec.gadget::run
+    syscall.exec_kernel_proc
+end

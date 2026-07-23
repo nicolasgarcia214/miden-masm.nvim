@@ -1,0 +1,23 @@
+#! Fixture math module.
+
+# The largest value a fixture can hold. Mentions of MAX_VALUE in comments
+# must not count as references.
+pub const MAX_VALUE = 4294967295
+
+pub const ERR_OVERFLOW = "sum exceeded MAX_VALUE # not a comment"
+
+#! Adds two values, asserting the result stays below MAX_VALUE.
+pub proc add_checked
+    add
+    dup push.MAX_VALUE lte assert.err=ERR_OVERFLOW
+end
+
+# A private helper.
+proc halve
+    div.2
+end
+
+pub proc mul_checked
+    mul
+    exec.halve exec.halve
+end

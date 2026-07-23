@@ -1,0 +1,17 @@
+#! Adversarial fixture: malformed module paths and misleading comments must
+#! degrade gracefully, never crash indexing, goto or references.
+#! use {ghost} from ::
+# use ::
+
+use {broken} from ::
+use ::
+
+proc unrelated
+    push.1 drop
+end
+
+# An unclosed brace after valid code: everything below is "inside" it and the
+# scan must stop cleanly instead of re-scanning to EOF per occurrence.
+use {never_closed
+use {also_never_closed
+use {still_open

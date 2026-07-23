@@ -1,0 +1,12 @@
+#! Re-exports from fix::core::math, one renamed.
+
+pub use {MAX_VALUE as LIMIT} from fix::core::math
+pub use {
+    add_checked,
+    mul_checked as mul,
+} from fix::core::math
+
+#! Doubles the top of the stack, checked.
+pub proc double
+    dup exec.add_checked
+end

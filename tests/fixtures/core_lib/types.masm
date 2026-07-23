@@ -1,0 +1,7 @@
+#! Fixture type aliases.
+
+# A two-element pair.
+pub type Pair = struct { first: felt, second: felt }
+
+# The number of elements in a Pair.
+pub const PAIR_SIZE = 2

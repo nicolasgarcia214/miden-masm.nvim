@@ -1,0 +1,8 @@
+#! Renamed selective import plus an unresolvable module.
+
+use {MAX_VALUE as ALIASED_MAX} from fix::core::math
+use fix::nowhere::gone
+
+proc check
+    push.ALIASED_MAX lte assertz
+end

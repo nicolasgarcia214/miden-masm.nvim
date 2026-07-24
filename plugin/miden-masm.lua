@@ -16,6 +16,12 @@ if vim.g.loaded_miden_masm then
 end
 vim.g.loaded_miden_masm = 1
 
+-- Neovim's built-in `*.masm` -> masm detection only exists on 0.11+; on the
+-- advertised 0.10.4 floor the extension is unknown and buffers fall back to
+-- `conf`, so nothing in this plugin would activate. Registering it here is a
+-- no-op on 0.11+ (same extension, same filetype).
+vim.filetype.add({ extension = { masm = "masm" } })
+
 vim.api.nvim_create_autocmd("User", {
   pattern = "TSUpdate",
   group = vim.api.nvim_create_augroup("miden_masm_parser", { clear = true }),

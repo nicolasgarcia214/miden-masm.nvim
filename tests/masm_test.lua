@@ -1,6 +1,6 @@
 -- Test suite for miden-masm.nvim, run against the fixture project in
 -- tests/fixtures/. Run with:
---   nvim --headless -u NONE -l tests/masm_test.lua
+--   nvim --headless --clean -l tests/masm_test.lua
 -- or `make test`.
 
 local script = debug.getinfo(1, "S").source:sub(2)

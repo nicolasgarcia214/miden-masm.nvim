@@ -24,7 +24,8 @@ with no language server required.
 - Correct comment settings (`#` / `#!`), 4-space indentation, and matchit
   words for Miden's `proc`/`begin`/`if.true`/`while.true` ... `end` blocks
   (Neovim's built-in `masm` filetype targets Microsoft Macro Assembler and
-  gets all of these wrong for Miden).
+  gets all of these wrong for Miden; on Neovim 0.10, which does not detect
+  `.masm` files at all, the plugin registers the filetype itself).
 
 Navigation is text-based and works out of the box; only highlighting,
 indentation and folds need the tree-sitter parser.
@@ -115,7 +116,8 @@ The resolver mirrors the Miden assembler's project model:
   constant `MAX_AMOUNT` and another spelling it `FUNGIBLE_ASSET_MAX_AMOUNT`
   both count as references to the same definition.
 - The index roots at your git root (or the outermost `miden-project.toml`),
-  skipping `target/` and hidden directories, and is cached per session.
+  skipping `target/`, `node_modules/` and hidden directories, and is cached
+  per session.
 
 On a large real-world project (the Miden protocol monorepo, ~180 files,
 ~37k lines) a cold references scan takes ~250 ms and a warm one ~180 ms;
@@ -138,9 +140,10 @@ vim.g.masm_goto = {
   ignore_dirs = { "target", "node_modules" },
 }
 
--- Set this to define your own keymaps instead of the default gd/grr/gO
--- (call require("masm.goto").references() / .document_symbols() directly;
--- 'tagfunc' stays active either way, so <C-]> and :tag keep working).
+-- Set this to define your own keymaps instead of the default gd/grr/gO/K
+-- (call require("masm.goto").references() / .document_symbols() and
+-- require("masm.hover").hover() directly; 'tagfunc' stays active either
+-- way, so <C-]> and :tag keep working).
 vim.g.masm_no_default_mappings = true
 
 -- Set this if you wire up vim.treesitter.start()/indentexpr/foldexpr

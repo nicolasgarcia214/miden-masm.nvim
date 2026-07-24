@@ -21,12 +21,14 @@ make test          # navigation test suite (no network needed)
 make test-queries  # builds the pinned grammar, validates the queries
 ```
 
-`make test` runs `tests/masm_test.lua` headlessly (`nvim --headless -u NONE`)
-against the fixture project in `tests/fixtures/`, which is a miniature Miden
-workspace: two namespaced libraries, a renamed re-export chain, a kernel
-library, a single-file account component and an adversarial fixture. No Miden
-checkout or network access is needed, and the suite exits non-zero on
-failure.
+`make test` runs three suites headlessly (`nvim --headless --clean`):
+`tests/masm_test.lua` (navigation) and `tests/hover_test.lua` against the
+fixture project in `tests/fixtures/`, which is a miniature Miden workspace --
+two namespaced libraries, a renamed re-export chain, a kernel library, a
+single-file account component and an adversarial fixture -- plus
+`tests/ftplugin_test.lua` for filetype detection and the ftplugin's
+setup/teardown. No Miden checkout or network access is needed, and each
+suite exits non-zero on failure.
 
 `make test-queries` clones and compiles the pinned tree-sitter-masm revision
 (network + C compiler required), then asserts each query in `queries/masm/`
@@ -55,8 +57,9 @@ fixtures can evolve.
 - `after/ftplugin/masm.lua` - buffer-local settings, keymaps, commands. In
   `after/` because it corrects Neovim's built-in `masm` (Microsoft
   assembler) ftplugin.
-- `plugin/miden-masm.lua` - registers the parser with nvim-treesitter via
-  the `User TSUpdate` autocmd. Do not "simplify" this into a one-off
+- `plugin/miden-masm.lua` - registers `*.masm` filetype detection (Neovim
+  0.10 lacks the built-in mapping) and the parser with nvim-treesitter via
+  the `User TSUpdate` autocmd. Do not "simplify" the latter into a one-off
   assignment; nvim-treesitter rebuilds its parser table on install/update
   and would silently discard it.
 - `queries/masm/*.scm` - queries ported from the grammar's Zed-oriented

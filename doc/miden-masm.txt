@@ -30,7 +30,9 @@ miden-masm.nvim provides Miden Assembly (`.masm`) support:
 
 Neovim ships a `masm` filetype for Microsoft Macro Assembler; this plugin
 corrects its settings (comments, indentation, matchit words) for Miden in
-`after/ftplugin/masm.lua`.
+`after/ftplugin/masm.lua`. On Neovim 0.10, which has no built-in `*.masm`
+detection (it was added in 0.11), the plugin registers the filetype mapping
+itself.
 
 Run `:checkhealth masm` to verify the installation.
 
@@ -103,9 +105,11 @@ g:masm_goto        Optional table: >lua
                                                    *g:masm_no_default_mappings*
 g:masm_no_default_mappings
                    When true, the plugin defines no keymaps; call
-                   `require("masm.goto").references()` and
-                   `.document_symbols()` from your own mappings. 'tagfunc'
-                   is still set, so CTRL-] and |:tag| keep working.
+                   `require("masm.goto").references()`,
+                   `.document_symbols()` and
+                   `require("masm.hover").hover()` from your own mappings.
+                   'tagfunc' is still set, so CTRL-] and |:tag| keep
+                   working.
 
                                                         *g:masm_no_treesitter*
 g:masm_no_treesitter

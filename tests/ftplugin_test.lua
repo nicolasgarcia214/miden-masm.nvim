@@ -2,13 +2,18 @@
 -- easy to break silently (a bar-swallowing command aborts the rest under
 -- `silent!`), so this asserts the state after `:setf masm` and again after
 -- switching filetype away.
--- Run with: nvim --headless -u NONE -l tests/ftplugin_test.lua (or make test)
+-- Run with: nvim --headless --clean -l tests/ftplugin_test.lua (or make test)
 
 local script = debug.getinfo(1, "S").source:sub(2)
 local here = vim.fs.dirname(vim.fn.fnamemodify(script, ":p"))
 local plugin_root = vim.fs.dirname(here)
 vim.opt.rtp:prepend(plugin_root)
 vim.opt.rtp:append(plugin_root .. "/after")
+-- The rtp edit above happens after startup, so plugin/ was not sourced the
+-- way a plugin manager would; source it explicitly. This is also what puts
+-- the plugin's own `*.masm` filetype registration under test -- Neovim 0.10
+-- has no built-in mapping and would otherwise detect `conf`.
+vim.cmd("runtime! plugin/miden-masm.lua")
 
 local failed = 0
 -- Neovim 0.11+ ships GLOBAL default grr/gO (LSP) mappings, so presence must

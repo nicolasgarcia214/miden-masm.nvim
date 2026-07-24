@@ -1,6 +1,6 @@
 -- Tests for masm.hover's content (the floating window itself is not
 -- exercised headlessly). Run with:
---   nvim --headless -u NONE -l tests/hover_test.lua
+--   nvim --headless --clean -l tests/hover_test.lua
 -- or `make test`.
 
 local script = debug.getinfo(1, "S").source:sub(2)

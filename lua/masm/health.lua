@@ -14,6 +14,13 @@ function M.check()
     health.error("require('masm.goto') failed -- is the plugin on 'runtimepath'?")
   end
 
+  local ok_data, data = pcall(require, "masm.instructions")
+  if pcall(require, "masm.hover") and ok_data and type(data) == "table" and #data > 0 then
+    health.ok("hover module and instruction reference load (K, " .. #data .. " instructions)")
+  else
+    health.error("hover module or instruction reference failed to load")
+  end
+
   if pcall(require, "nvim-treesitter") then
     health.ok("nvim-treesitter is installed")
   else

@@ -24,8 +24,9 @@ miden-masm.nvim provides Miden Assembly (`.masm`) support:
   calls `vim.treesitter.start()` and sets 'indentexpr'/'foldexpr', since
   nvim-treesitter's main branch enables nothing by itself. Opt out with
   |g:masm_no_treesitter|.
-- go-to-definition, references and document symbols, implemented with plain
-  text analysis of the project: no language server and no parser required
+- go-to-definition, references, document symbols and hover docs, implemented
+  with plain text analysis of the project: no language server and no parser
+  required
 
 Neovim ships a `masm` filetype for Microsoft Macro Assembler; this plugin
 corrects its settings (comments, indentation, matchit words) for Miden in
@@ -46,6 +47,17 @@ gd / CTRL-]        Jump to the definition of the name under the cursor:
                    `pub mod` name, jump to the module's file instead.
                    Implemented via 'tagfunc', so the full tag machinery
                    applies: CTRL-T to go back, |:tag|, |:tjump|, etc.
+
+                                                                *miden-masm-K*
+K                  Show hover documentation in a floating window. Names
+                   resolve exactly like `gd`: the float shows the
+                   definition's `#!` doc comment, `@` attribute lines and
+                   signature (plus the source file for cross-file
+                   definitions); module qualifiers show the module file's
+                   leading doc block. A bare opcode shows its description
+                   and stack effect from the bundled Miden instruction
+                   reference. Press K again to focus the float; `q` or
+                   moving the cursor closes it.
 
                                                               *miden-masm-grr*
 grr                Find references to the symbol under the cursor across the
@@ -138,6 +150,9 @@ The index roots at the git root (or the outermost directory containing a
 - The index walk and references scan run synchronously; very large trees
   (e.g. a full miden-vm checkout in `extra_roots`) slow the first jump and
   every references scan proportionally.
-- No completion, diagnostics, hover or rename.
+- Hover shows what the definition site documents; it does not compute stack
+  effects or types. The instruction reference is a generated snapshot (see
+  `lua/masm/instructions.lua` for provenance).
+- No completion, diagnostics or rename.
 
 vim:tw=78:ts=8:noet:ft=help:norl:

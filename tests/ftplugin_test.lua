@@ -37,6 +37,7 @@ check("shiftwidth 4", vim.bo.shiftwidth == 4)
 check("gd mapped", buf_mapped("gd"))
 check("grr mapped", buf_mapped("grr"))
 check("gO mapped", buf_mapped("gO"))
+check("K mapped", buf_mapped("K"))
 check("command exists", vim.fn.exists(":MasmRebuildIndex") == 2)
 
 -- Teardown: switching filetype must undo EVERYTHING; in particular the tail
@@ -47,6 +48,7 @@ check("teardown: tagfunc cleared", vim.bo.tagfunc == "", vim.bo.tagfunc)
 check("teardown: gd unmapped", not buf_mapped("gd"))
 check("teardown: grr unmapped", not buf_mapped("grr"))
 check("teardown: gO unmapped", not buf_mapped("gO"))
+check("teardown: K unmapped", not buf_mapped("K"))
 check("teardown: command removed", vim.fn.exists(":MasmRebuildIndex") == 0)
 check("teardown: match_words cleared", vim.b.match_words == nil)
 
@@ -54,6 +56,7 @@ check("teardown: match_words cleared", vim.b.match_words == nil)
 vim.g.masm_no_default_mappings = true
 vim.bo.filetype = "masm"
 check("opt-out: no gd mapping", not buf_mapped("gd"))
+check("opt-out: no K mapping", not buf_mapped("K"))
 check("opt-out: tagfunc still set", vim.bo.tagfunc:find("masm.goto", 1, true) ~= nil)
 vim.g.masm_no_default_mappings = nil
 

@@ -45,6 +45,12 @@ fixtures can evolve.
   symbol resolution, tagfunc, references, document symbols. Resolution is
   deliberately text-based; see the header comment before reaching for
   tree-sitter here.
+- `lua/masm/hover.lua` - `K` hover: definition-site doc blocks via the
+  resolver, instruction docs via the generated reference.
+- `lua/masm/instructions.lua` - GENERATED instruction metadata; do not edit.
+  Regenerate with `scripts/gen_instructions.py` against a
+  [masm-lsp](https://github.com/trailofbits/masm-lsp) checkout when Miden
+  adds or changes instructions.
 - `lua/masm/health.lua` - `:checkhealth masm`.
 - `after/ftplugin/masm.lua` - buffer-local settings, keymaps, commands. In
   `after/` because it corrects Neovim's built-in `masm` (Microsoft

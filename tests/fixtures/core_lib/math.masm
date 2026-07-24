@@ -17,6 +17,11 @@ proc halve
     div.2
 end
 
+#! Multiplies two values, then halves the product twice.
+#!
+#! Inputs:  [b, a, ...]
+#! Outputs: [(a * b) / 4, ...]
+@locals(2)
 pub proc mul_checked
     mul
     exec.halve exec.halve

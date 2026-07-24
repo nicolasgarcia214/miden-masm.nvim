@@ -1161,6 +1161,31 @@ end
 -- Entry points
 ---------------------------------------------------------------------------
 
+-- Resolves the name under the cursor exactly as `gd` would, without jumping.
+-- Returns the tag item ({ name, filename, cmd = lnum, user_data =
+-- "symbol"|"module" }), or nil and a reason. Public: masm.hover builds on it,
+-- and custom mappings can too.
+function M.resolve()
+  local bufpath = vim.api.nvim_buf_get_name(0)
+  if bufpath == "" then
+    return nil, "unnamed buffer"
+  end
+  local ok, index = pcall(build_index, bufpath, get_config())
+  if not ok then
+    return nil, "indexing failed: " .. tostring(index)
+  end
+  local buftext = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "\n")
+  local res_ok, item, reason = pcall(resolve_at_cursor, index, buftext, bufpath)
+  if not res_ok then
+    return nil, tostring(item)
+  end
+  return item, reason
+end
+
+-- Bounded, symlink/FIFO-safe file read, shared with masm.hover so hovers
+-- honor the same untrusted-input rules as the index. Not public API.
+M._read_file = read_file
+
 -- 'tagfunc' implementation. With the 'c' flag (normal-mode <C-]> / gd) the
 -- cursor context drives resolution; otherwise `pattern` (from `:tag foo` or
 -- tag completion) is parsed as a plain path.

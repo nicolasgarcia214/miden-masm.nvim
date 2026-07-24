@@ -1,8 +1,8 @@
 # miden-masm.nvim
 
 Neovim support for [Miden Assembly](https://0xmiden.github.io/miden-docs/) (`.masm`):
-tree-sitter highlighting plus project-aware code navigation, with no language
-server required.
+tree-sitter highlighting plus project-aware code navigation and hover docs,
+with no language server required.
 
 ## Features
 
@@ -11,6 +11,12 @@ server required.
   grammar, with queries hand-ported to Neovim's capture conventions.
 - Go to definition (`gd` / `<C-]>`) for procedures, constants, types and
   modules, across library boundaries.
+- Hover docs (`K`): the `#!` doc comment, `@` attributes and signature of the
+  definition under the cursor -- the `Inputs:/Outputs:` stack contracts Miden
+  code documents are readable at the call site without jumping. On a bare
+  opcode, its description and stack effect from the Miden instruction
+  reference (e.g. `u32overflowing_add`:
+  `(b, a, ...) → (overflow, (a + b) mod 2^32, ...)`).
 - Find references (`grr`) into the quickfix list, resolving every candidate
   usage to its ground-truth definition, so renamed re-exports are unified
   correctly.
@@ -79,6 +85,11 @@ All mappings are buffer-local to `.masm` files:
   segment, or on a `pub mod` name, this opens the module's file instead.
   `<C-t>` jumps back (the whole tag stack works, including `:tag`,
   `:tjump` and friends).
+- `K` - hover documentation for the name under the cursor: the definition's
+  doc comment, attributes and signature (resolved exactly like `gd`, so
+  renamed imports and re-exports work), or the instruction reference entry
+  for a bare opcode. Press `K` again to focus the float; `q` or moving the
+  cursor closes it.
 - `grr` - find references project-wide, into the quickfix list with the
   definition first. On a module qualifier or `use` path it lists every
   `use` statement importing that module.
@@ -173,7 +184,12 @@ Honest list, so you know what you are getting:
   index itself (which files and libraries exist) refreshes only on
   `:MasmRebuildIndex`, so run that after creating, deleting or moving
   `.masm` files or `miden-project.toml` manifests.
-- No completion, diagnostics, hover, or rename. For diagnostics there is
+- Hover shows what the definition site says (doc comment, signature); it
+  does not compute stack effects or types itself. The bundled instruction
+  reference is generated from Trail of Bits'
+  [masm-lsp](https://github.com/trailofbits/masm-lsp) metadata and pins that
+  snapshot of the Miden docs.
+- No completion, diagnostics, or rename. For diagnostics there is
   [miden-lsp](https://github.com/0xMiden/miden-lsp); note it derives syntax
   errors from the same stale grammar, so expect false positives on import
   headers.

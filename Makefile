@@ -6,6 +6,7 @@ PARSER_BUILD := tests/.parser-build
 .PHONY: test test-queries
 test:
 	nvim --headless --clean -l tests/masm_test.lua
+	nvim --headless --clean -l tests/hover_test.lua
 	nvim --headless --clean -l tests/ftplugin_test.lua
 
 test-queries: $(PARSER_BUILD)/parser/masm.so

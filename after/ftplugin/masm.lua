@@ -69,6 +69,10 @@ if not vim.g.masm_no_default_mappings then
   vim.keymap.set("n", "gO", function()
     require("masm.goto").document_symbols()
   end, { buffer = true, desc = "MASM document symbols" })
+  -- K would otherwise run 'keywordprg' (:Man), which knows no MASM name.
+  vim.keymap.set("n", "K", function()
+    require("masm.hover").hover()
+  end, { buffer = true, desc = "MASM hover" })
 end
 vim.api.nvim_buf_create_user_command(0, "MasmRebuildIndex", function()
   require("masm.goto").clear_cache()
@@ -93,6 +97,7 @@ local undo = "setl commentstring< comments< iskeyword< tagfunc<"
   .. " | exe 'silent! nunmap <buffer> gd'"
   .. " | exe 'silent! nunmap <buffer> grr'"
   .. " | exe 'silent! nunmap <buffer> gO'"
+  .. " | exe 'silent! nunmap <buffer> K'"
   .. " | silent! delcommand -buffer MasmRebuildIndex"
 local base = vim.b.undo_ftplugin
 vim.b.undo_ftplugin = (base and base ~= "" and base .. " | " or "") .. undo

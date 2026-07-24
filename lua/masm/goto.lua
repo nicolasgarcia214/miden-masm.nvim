@@ -448,7 +448,9 @@ local USE_BRACES_MAX = 4096
 -- uninterruptible Lua pattern call (~18 s for 140 KB). Here each candidate
 -- does one bounded plain find, so the whole scan stays linear.
 local function each_selective_use(code, pub_only, fn)
-  local pat = pub_only and "%f[%w]pub%s+use%s*{()" or "%f[%w]use%s*{()"
+  -- `%f[%w_]`, not `%f[%w]`: the keyword must not be the tail of a longer
+  -- identifier like `my_use`.
+  local pat = pub_only and "%f[%w_]pub%s+use%s*{()" or "%f[%w_]use%s*{()"
   local init = 1
   while true do
     local s, brace_open, bpos = code:find(pat, init)
@@ -519,7 +521,9 @@ end
 ---------------------------------------------------------------------------
 
 -- Finds the definition line of `name` (a proc, const or type) in `text`.
--- `name` is escaped: it may come from user-typed `:tag` input.
+-- `name` is escaped: it may come from user-typed `:tag` input. The frontier
+-- is `%f[^%w_]`, not `%f[%W]`: Lua's %w excludes `_`, so the latter would
+-- let `add` match the definition of `add_checked`.
 local function find_def_line(text, name)
   local pat = vim.pesc(name)
   local lnum = 0
@@ -527,7 +531,7 @@ local function find_def_line(text, name)
     lnum = lnum + 1
     local l = strip_pub(line)
     for _, kw in ipairs({ "proc", "const", "type" }) do
-      if l:match("^" .. kw .. "%s+" .. pat .. "%f[%W]") then
+      if l:match("^" .. kw .. "%s+" .. pat .. "%f[^%w_]") then
         return lnum
       end
     end
@@ -860,7 +864,7 @@ local function resolve_at_cursor(index, buftext, bufpath)
   local stripped = strip_pub(t.line)
 
   -- `pub mod name` (mod.masm): open the submodule file next to this one.
-  if stripped:match("^mod%s+" .. vim.pesc(t.token) .. "%f[%W]") then
+  if stripped:match("^mod%s+" .. vim.pesc(t.token) .. "%f[^%w_]") then
     local dir = vim.fs.dirname(bufpath)
     for _, c in ipairs({ dir .. "/" .. t.token .. ".masm", dir .. "/" .. t.token .. "/mod.masm" }) do
       if file_exists(c) then
@@ -905,7 +909,7 @@ local function resolve_at_cursor(index, buftext, bufpath)
   end
 
   -- Plain `use a::b` / `use a::b as x` lines: jump to the module file.
-  if stripped:match("^use%f[%W]") then
+  if stripped:match("^use%f[^%w_]") then
     local prefix = vim.list_slice(t.segs, 1, t.active)
     if #prefix == 1 and mods[t.token] then
       prefix = mods[t.token] -- cursor on the alias name itself
@@ -1134,7 +1138,7 @@ function M.document_symbols()
       or l:match("^const%s+[%w_]")
       or l:match("^type%s+[%w_]")
       or l:match("^mod%s+[%w_]")
-      or line:match("^begin%f[%W]") -- program entrypoint
+      or line:match("^begin%f[^%w_]") -- program entrypoint, not `begin_foo`
     then
       table.insert(items, {
         bufnr = bufnr,

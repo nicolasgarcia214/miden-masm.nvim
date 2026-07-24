@@ -150,6 +150,15 @@ local cases = {
     off = 19,
     expect_fail = true,
   },
+  {
+    -- Lua's %w excludes `_`; a `%f[%W]` frontier once let `add` match the
+    -- definition of `add_checked`.
+    desc = "bare instruction is not a prefix-match of a proc name",
+    file = "core_lib/math.masm",
+    find = "    add",
+    off = 4,
+    expect_fail = true,
+  },
 }
 
 for _, c in ipairs(cases) do
@@ -382,6 +391,16 @@ for _, s in ipairs(syms) do
   end
 end
 check("symbols: entrypoint listed", has_begin)
+vim.cmd("edit! " .. root .. "app/hostile.masm")
+syms = goto_mod.document_symbols() or {}
+close_lists()
+local impostor = false
+for _, s in ipairs(syms) do
+  if s.text:find("begin_impostor", 1, true) then
+    impostor = true
+  end
+end
+check("symbols: begin_impostor is not an entrypoint", not impostor)
 
 print(failed == 0 and "ALL PASS" or (failed .. " FAILURES"))
 if failed > 0 then

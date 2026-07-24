@@ -10,6 +10,9 @@ proc unrelated
     push.1 drop
 end
 
+# Prefix trap: an identifier starting with `begin` is not an entrypoint.
+begin_impostor
+
 # An unclosed brace after valid code: everything below is "inside" it and the
 # scan must stop cleanly instead of re-scanning to EOF per occurrence.
 use {never_closed

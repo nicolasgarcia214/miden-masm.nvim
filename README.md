@@ -1,8 +1,8 @@
 # miden-masm.nvim
 
 Neovim support for [Miden Assembly](https://0xmiden.github.io/miden-docs/) (`.masm`):
-tree-sitter highlighting plus project-aware code navigation and hover docs,
-with no language server required.
+tree-sitter highlighting plus project-aware code navigation, hover docs and
+static stack analysis, with no language server required.
 
 ## Features
 
@@ -21,6 +21,18 @@ with no language server required.
   usage to its ground-truth definition, so renamed re-exports are unified
   correctly.
 - Document symbols (`gO`) into the location list.
+- Stack analysis: a per-instruction operand-stack simulator that catches the
+  bug class the VM only rejects at runtime -- a `call`-invoked procedure not
+  returning at stack depth exactly 16 (`InvalidStackDepthOnReturn`). In the
+  Miden protocol repo this class shipped more than once: a getter whose
+  cleanup drops 3 elements where 4 are needed aborts on *every* invocation,
+  and no test catches it. The analyzer flags it as you type, verifies the
+  handwritten `# => [...]` stack comments against the simulation (the buggy
+  getter's comment is flagged one line before the faulty cleanup), checks
+  declared `Inputs:/Outputs:` contracts against the 16-element call ABI, and
+  offers an inferred-stack ghost-text overlay (`:MasmStackToggle`) showing
+  `# => [VALUE, pad(16)]`-style state on lines that have no handwritten
+  annotation.
 - Correct comment settings (`#` / `#!`), 4-space indentation, and matchit
   words for Miden's `proc`/`begin`/`if.true`/`while.true` ... `end` blocks
   (Neovim's built-in `masm` filetype targets Microsoft Macro Assembler and
@@ -97,6 +109,10 @@ All mappings are buffer-local to `.masm` files:
 - `gO` - list the buffer's definitions (procs, consts, types, submodules,
   entrypoint) in the location list.
 - `:MasmRebuildIndex` - drop the cached project index (see below).
+- `:MasmStackToggle` - toggle the inferred-stack ghost-text overlay for this
+  buffer. Stack diagnostics are on by default and refresh on `InsertLeave`,
+  normal-mode edits (debounced) and every write; they render through your
+  normal `vim.diagnostic` configuration under the source name `masm-stack`.
 
 ## How name resolution works
 
@@ -149,6 +165,19 @@ vim.g.masm_no_default_mappings = true
 -- Set this if you wire up vim.treesitter.start()/indentexpr/foldexpr
 -- yourself (LazyVim users do not need it; double-starting is harmless).
 vim.g.masm_no_treesitter = true
+
+-- Stack analysis. All fields optional; these are the defaults.
+vim.g.masm_stack = {
+  diagnostics = true, -- publish stack diagnostics via vim.diagnostic
+  overlay = false, -- start new buffers with the ghost-text overlay on
+  overlay_mode = "auto", -- "auto": ghost only unannotated/stale lines; "all"
+  check_comments = true, -- verify handwritten `# => [...]` comments (WARN)
+  bail_hints = false, -- HINT diagnostics on procedures that cannot be analyzed
+  debounce_ms = 300, -- delay after edits before re-analysis
+}
+
+-- Set this to disable stack analysis entirely (no autocmds, no command).
+vim.g.masm_no_stack = true
 ```
 
 Both list options also accept a single string as a one-element list.
@@ -187,12 +216,26 @@ Honest list, so you know what you are getting:
   index itself (which files and libraries exist) refreshes only on
   `:MasmRebuildIndex`, so run that after creating, deleting or moving
   `.masm` files or `miden-project.toml` manifests.
-- Hover shows what the definition site says (doc comment, signature); it
-  does not compute stack effects or types itself. The bundled instruction
-  reference is generated from Trail of Bits'
+- Hover shows what the definition site says (doc comment, signature). The
+  bundled instruction reference is generated from Trail of Bits'
   [masm-lsp](https://github.com/trailofbits/masm-lsp) metadata and pins that
   snapshot of the Miden docs.
-- No completion, diagnostics, or rename. For diagnostics there is
+- Stack analysis is a static approximation, not the assembler: absence of
+  diagnostics is not a correctness proof. Procedures without a
+  `#! Invocation:` doc tag (or a script attribute with a padded 16-element
+  `Inputs:` contract) are skipped -- that includes most kernel-internal code
+  by design. `dynexec`/`dyncall` targets and `exec` callees without parseable
+  `Inputs:/Outputs:` contracts make the state unknown until the next
+  handwritten `# => [...]` comment resynchronizes it (opt into seeing these
+  with `bail_hints`). An `exec` whose consumption reaches the 16-element
+  stack floor has an internals-dependent exact depth and is likewise
+  resynchronized from the next comment. Comments in `exec`-invoked
+  procedures are checked for adoption but never flagged (they legitimately
+  mix declared-inputs and caller views); wrong element *order* is invisible
+  whenever the widths still match. An unknown instruction skips the whole
+  procedure with a stated reason rather than guessing.
+- No completion or rename, and no diagnostics beyond stack analysis. For
+  assembler diagnostics there is
   [miden-lsp](https://github.com/0xMiden/miden-lsp); note it derives syntax
   errors from the same stale grammar, so expect false positives on import
   headers.

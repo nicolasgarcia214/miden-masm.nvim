@@ -1,0 +1,190 @@
+#! Fixture program for the stack analyzer (tests/stack_test.lua).
+#! The first two procs are a faithful port of the real min_burn_amount bug
+#! (call-invoked getter returning at depth 17) and its corrected twin.
+
+use fix::core::math
+use fix::core::registry
+use {VALUE_SLOT} from fix::core::registry
+
+const WORD_CONST = word("fix::app::stack::word_const")
+const BRACKET_WORD = [1, 0, 0, 0]
+const FELT_CONST = 7
+
+#! Returns the configured minimum value. BUGGY: drops 3 where 4 are needed.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [min_value, pad(15)]
+#!
+#! Invocation: call
+pub proc get_min_value_buggy
+    push.VALUE_SLOT[0..2] exec.registry::get_item
+    # => [min_value, 0, 0, 0, pad(12)]
+
+    movdn.3 drop drop drop
+    # => [min_value, pad(15)]
+end
+
+#! Returns the configured minimum value, with correct cleanup.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [min_value, pad(15)]
+#!
+#! Invocation: call
+pub proc get_min_value_good
+    push.VALUE_SLOT[0..2] exec.registry::get_item
+    # => [min_value, 0, 0, 0, pad(16)]
+
+    movdn.4 dropw
+    # => [min_value, pad(15)]
+end
+
+#! Declares a 12-element ABI on a call procedure: convention violation.
+#!
+#! Inputs:  [a, pad(11)]
+#! Outputs: [a, pad(11)]
+#!
+#! Invocation: call
+pub proc bad_abi
+    push.1 drop
+end
+
+#! Diverging then-arm (`push.0 assert`): the else arm's state must win.
+#!
+#! Inputs:  [flag, pad(15)]
+#! Outputs: [pad(16)]
+#!
+#! Invocation: call
+pub proc diverge_ok
+    if.true
+        push.0 assert
+    else
+        nop
+    end
+end
+
+#! Branch arms leaving different depths without a call or divergence.
+#!
+#! Inputs:  [flag, pad(15)]
+#! Outputs: [pad(16)]
+#!
+#! Invocation: call
+pub proc branch_mismatch
+    if.true
+        push.1
+    else
+        push.1 push.2
+    end
+end
+
+#! A well-formed while loop (body net +1) and a repeat block.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [pad(16)]
+#!
+#! Invocation: call
+pub proc loop_ok
+    push.1
+    while.true
+        push.0
+    end
+    repeat.3
+        push.1 drop
+    end
+end
+
+#! While body that fails the net +1 rule.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [pad(16)]
+#!
+#! Invocation: call
+pub proc loop_bad
+    push.1
+    while.true
+        push.0 push.0
+    end
+end
+
+#! dropw at the floor pulls zeros; must NOT be flagged.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [pad(16)]
+#!
+#! Invocation: call
+pub proc floor_drop
+    dropw
+    # => [pad(16)]
+end
+
+#! Uses an instruction the arity table does not know: bails.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [pad(16)]
+#!
+#! Invocation: call
+pub proc unknown_instr
+    frobnicate
+end
+
+#! Exec callee without a contract poisons; the tracker recovers.
+#!
+#! Inputs:  [b, a, pad(14)]
+#! Outputs: [sum, pad(15)]
+#!
+#! Invocation: call
+pub proc missing_contract
+    exec.math::add_checked
+    # => [sum, pad(15)]
+end
+
+#! Constant push widths: word("..."), bracket word, plain felt.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [pad(16)]
+#!
+#! Invocation: call
+pub proc const_widths
+    push.WORD_CONST
+    # => [WORD_CONST, pad(16)]
+    dropw
+    push.BRACKET_WORD
+    # => [BRACKET_WORD, pad(16)]
+    dropw
+    push.FELT_CONST
+    drop
+end
+
+#! Exec-invoked pair: net effect matches the declared Outputs.
+#!
+#! Inputs:  [b, a]
+#! Outputs: [sum]
+#!
+#! Invocation: exec
+pub proc add_pair
+    add
+end
+
+#! Exec-invoked with a wrong Outputs declaration: net-effect warning.
+#!
+#! Inputs:  [b, a]
+#! Outputs: [sum, extra]
+#!
+#! Invocation: exec
+pub proc add_pair_bad
+    add
+end
+
+#! Consumes beneath its declared Inputs: the exec danger zone.
+#!
+#! Inputs:  [a]
+#! Outputs: []
+#!
+#! Invocation: exec
+pub proc eats_caller
+    drop drop
+end
+
+# No doc contract and no Invocation tag: skipped with a reason.
+pub proc unannotated
+    push.1 drop
+end

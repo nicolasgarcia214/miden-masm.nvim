@@ -6,6 +6,18 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- Static stack analysis: a per-instruction operand-stack simulator publishes
+  `vim.diagnostic` errors when a `call`-invoked procedure would return at a
+  stack depth other than the mandatory 16 (the VM rejects every such call at
+  runtime with `InvalidStackDepthOnReturn`), when a declared
+  `Inputs:/Outputs:` contract violates the 16-element call ABI, and warnings
+  when handwritten `# => [...]` stack comments disagree with the simulation.
+  `:MasmStackToggle` shows an inferred-stack ghost-text overlay on lines
+  without handwritten annotations. Configured via `vim.g.masm_stack`;
+  disabled entirely with `vim.g.masm_no_stack`. Cross-procedure effects come
+  from the callees' declared stack contracts through the existing project
+  index; procedures that cannot be analyzed are skipped with a stated
+  reason, never guessed at.
 - `K` hover documentation: the definition's `#!` doc comment, `@` attributes
   and signature (resolved exactly like `gd`, so renamed imports and
   re-exports work), module doc blocks on qualifiers, and description plus

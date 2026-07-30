@@ -9,9 +9,10 @@ CONTENTS                                                          *miden-masm*
   1. Introduction ................................. |miden-masm-introduction|
   2. Mappings ......................................... |miden-masm-mappings|
   3. Commands ......................................... |miden-masm-commands|
-  4. Configuration ...................................... |miden-masm-config|
-  5. Name resolution ................................ |miden-masm-resolution|
-  6. Limitations .................................... |miden-masm-limitations|
+  4. Stack analysis .................................... |miden-masm-stack|
+  5. Configuration ...................................... |miden-masm-config|
+  6. Name resolution ................................ |miden-masm-resolution|
+  7. Limitations .................................... |miden-masm-limitations|
 
 ==============================================================================
 1. INTRODUCTION                                      *miden-masm-introduction*
@@ -27,6 +28,9 @@ miden-masm.nvim provides Miden Assembly (`.masm`) support:
 - go-to-definition, references, document symbols and hover docs, implemented
   with plain text analysis of the project: no language server and no parser
   required
+- static stack analysis: per-instruction operand-stack simulation with
+  |vim.diagnostic| errors for call-ABI violations and stale `# => [...]`
+  comments, plus an inferred-stack ghost-text overlay (|:MasmStackToggle|)
 
 Neovim ships a `masm` filetype for Microsoft Macro Assembler; this plugin
 corrects its settings (comments, indentation, matchit words) for Miden in
@@ -84,8 +88,63 @@ gO                 List the buffer's definitions (procs, consts, types,
                    existing files do not need this: definition positions are
                    re-read whenever a file's mtime changes.
 
+                                                            *:MasmStackToggle*
+:MasmStackToggle   Toggle the inferred-stack ghost-text overlay for the
+                   current buffer. See |miden-masm-stack|.
+
 ==============================================================================
-4. CONFIGURATION                                           *miden-masm-config*
+4. STACK ANALYSIS                                           *miden-masm-stack*
+
+The analyzer simulates the operand stack instruction by instruction inside
+every procedure that declares how it is invoked (`#! Invocation:` doc tag,
+or a `@note_script`-style attribute with a padded 16-element `Inputs:`
+contract). Cross-procedure effects come from the callee's declared
+`#! Inputs:`/`#! Outputs:` stack contract -- callee bodies are never
+analyzed on behalf of a caller.
+
+Diagnostics are published through |vim.diagnostic| (source `masm-stack`) and
+render however your diagnostic config says; the plugin never draws them
+itself. Codes:
+
+  exit-depth        ERROR  A `call`/`syscall`/`dyncall`-invoked procedure
+                           returns at a stack depth other than 16. The VM
+                           rejects every invocation of such a procedure at
+                           runtime (`InvalidStackDepthOnReturn`).
+  abi-16            ERROR  An `Invocation: call`/`dyncall` procedure declares
+                           `Inputs:`/`Outputs:` that do not sum to the
+                           mandatory 16 elements.
+  comment-stale     WARN   A handwritten `# => [...]` comment disagrees with
+                           the simulated stack width at that point.
+  exec-net          WARN   An `exec`-invoked procedure's body leaves a
+                           different number of elements than its `Outputs:`
+                           declares.
+  caller-underflow  WARN   An `exec`-invoked procedure consumes elements
+                           beneath its declared `Inputs:` -- it eats the
+                           caller's stack.
+  branch-depth      WARN   `if.true` arms leave different depths without a
+                           diverging (`push.0 assert`) or re-normalizing
+                           (`call`/`dyncall`) arm to explain it.
+  while-net         WARN   A `while.true` body does not leave exactly one new
+                           element (the continuation flag).
+  callee-unresolved HINT   A callee's stack effect could not be determined;
+                           analysis resumes at the next `# => [...]` comment.
+                           Hidden unless `bail_hints` is set.
+
+The overlay (off by default, |:MasmStackToggle|) appends ghost text like
+`# => [VALUE, pad(16)]` at end of line, in the same notation Miden code uses
+for handwritten comments. In "auto" mode only lines without a handwritten
+tracker get ghost text -- plus lines whose tracker is stale, which show the
+corrected state highlighted with `MasmStackVirtualTextStale`. Highlight
+groups: `MasmStackVirtualText` (links to `NonText`) and
+`MasmStackVirtualTextStale` (links to `DiagnosticVirtualTextWarn`).
+
+Analysis runs on |InsertLeave| and normal-mode edits (debounced) and on
+every write, whole-buffer, synchronously and bounded: oversized buffers,
+per-procedure instruction budgets and cross-file lookup budgets all degrade
+to skipped procedures with a stated reason, never to guesses.
+
+==============================================================================
+5. CONFIGURATION                                           *miden-masm-config*
 
                                                                  *g:masm_goto*
 g:masm_goto        Optional table: >lua
@@ -118,8 +177,28 @@ g:masm_no_treesitter
                    'foldmethod' and 'foldexpr' alone. Use it when your
                    config wires tree-sitter features itself.
 
+                                                                *g:masm_stack*
+g:masm_stack       Optional table configuring stack analysis; all fields
+                   optional, defaults shown: >lua
+                     vim.g.masm_stack = {
+                       diagnostics = true,     -- publish diagnostics
+                       overlay = false,        -- overlay on for new buffers
+                       overlay_mode = "auto",  -- "auto" | "all"
+                       check_comments = true,  -- verify `# =>` comments
+                       bail_hints = false,     -- HINT unanalyzable procs
+                       debounce_ms = 300,      -- edit debounce
+                     }
+<
+                   Read on every refresh; changes apply to the next
+                   analysis pass.
+
+                                                             *g:masm_no_stack*
+g:masm_no_stack    When true, stack analysis is not wired at all for new
+                   `masm` buffers: no autocmds, no |:MasmStackToggle|, zero
+                   cost.
+
 ==============================================================================
-5. NAME RESOLUTION                                     *miden-masm-resolution*
+6. NAME RESOLUTION                                     *miden-masm-resolution*
 
 The resolver mirrors the Miden assembler's project model:
 
@@ -139,7 +218,7 @@ The index roots at the git root (or the outermost directory containing a
 `miden-project.toml`) and is cached for the session.
 
 ==============================================================================
-6. LIMITATIONS                                        *miden-masm-limitations*
+7. LIMITATIONS                                        *miden-masm-limitations*
 
 - The pinned tree-sitter grammar predates the current dialect: `use {..}
   from ..`, `pub mod` and `use .. as ..` parse as ERROR nodes, which mainly
@@ -154,9 +233,17 @@ The index roots at the git root (or the outermost directory containing a
 - The index walk and references scan run synchronously; very large trees
   (e.g. a full miden-vm checkout in `extra_roots`) slow the first jump and
   every references scan proportionally.
-- Hover shows what the definition site documents; it does not compute stack
-  effects or types. The instruction reference is a generated snapshot (see
-  `lua/masm/instructions.lua` for provenance).
-- No completion, diagnostics or rename.
+- Hover shows what the definition site documents. The instruction reference
+  is a generated snapshot (see `lua/masm/instructions.lua` for provenance).
+- Stack analysis is a static approximation: absence of diagnostics is not a
+  correctness proof. Procedures without an `#! Invocation:` tag are skipped;
+  `dynexec`/`dyncall` targets and undocumented `exec` callees make the state
+  unknown until the next handwritten `# => [...]` comment; `exec`s that
+  reach the 16-element floor have internals-dependent depth and are likewise
+  resynchronized from comments; comments in `exec`-invoked procedures are
+  never flagged (they legitimately mix views); wrong element ORDER is
+  invisible while widths match; unknown instructions skip the procedure with
+  a stated reason.
+- No completion or rename; no diagnostics beyond stack analysis.
 
 vim:tw=78:ts=8:noet:ft=help:norl:

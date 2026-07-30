@@ -304,12 +304,13 @@ check(
 )
 
 -- Module references: cursor on the qualifier lists use-lines project-wide.
--- Exactly six statements import fix::core::math: three in main.masm, one in
--- aliased.masm, two pub-use re-exports in wrappers.masm.
+-- Exactly seven statements import fix::core::math: three in main.masm, one
+-- in aliased.masm, two pub-use re-exports in wrappers.masm, one in
+-- stack.masm (the stack-analyzer fixture).
 place("app/main.masm", "exec.math::add_checked", 6)
 refs = goto_mod.references() or {}
 close_lists()
-check("refs: exactly the six use-sites found", #refs == 6, "got " .. #refs)
+check("refs: exactly the seven use-sites found", #refs == 7, "got " .. #refs)
 local all_use = #refs > 0
 for _, r in ipairs(refs) do
   if not r.text:find("use", 1, true) then

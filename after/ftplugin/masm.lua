@@ -76,8 +76,20 @@ if not vim.g.masm_no_default_mappings then
 end
 vim.api.nvim_buf_create_user_command(0, "MasmRebuildIndex", function()
   require("masm.goto").clear_cache()
+  require("masm.stack").clear_cache()
   vim.notify("masm goto: index cleared; it rebuilds on the next jump")
 end, { desc = "Rebuild the MASM go-to-definition project index" })
+
+-- Stack analysis (lua/masm/stack.lua + stackview.lua): publishes depth/ABI
+-- diagnostics and offers an inferred-stack eol overlay via :MasmStackToggle.
+-- `vim.g.masm_no_stack = true` wires nothing at all -- the zero-cost opt-out,
+-- matching masm_no_treesitter / masm_no_default_mappings.
+if not vim.g.masm_no_stack then
+  require("masm.stackview").attach(0)
+  vim.api.nvim_buf_create_user_command(0, "MasmStackToggle", function()
+    require("masm.stackview").toggle(0)
+  end, { desc = "Toggle the inferred-stack ghost-text overlay" })
+end
 
 -- Let `:setfiletype` teardown undo everything we set above. `silent!`
 -- everywhere: if another plugin already removed a mapping, teardown must
@@ -99,5 +111,7 @@ local undo = "setl commentstring< comments< iskeyword< tagfunc<"
   .. " | exe 'silent! nunmap <buffer> gO'"
   .. " | exe 'silent! nunmap <buffer> K'"
   .. " | silent! delcommand -buffer MasmRebuildIndex"
+  .. " | silent! call v:lua.require'masm.stackview'.detach()"
+  .. " | silent! delcommand -buffer MasmStackToggle"
 local base = vim.b.undo_ftplugin
 vim.b.undo_ftplugin = (base and base ~= "" and base .. " | " or "") .. undo

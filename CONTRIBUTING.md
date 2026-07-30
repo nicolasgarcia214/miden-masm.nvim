@@ -22,10 +22,13 @@ make test-queries  # builds the pinned grammar, validates the queries
 ```
 
 `make test` runs three suites headlessly (`nvim --headless --clean`):
-`tests/masm_test.lua` (navigation) and `tests/hover_test.lua` against the
-fixture project in `tests/fixtures/`, which is a miniature Miden workspace --
-two namespaced libraries, a renamed re-export chain, a kernel library, a
-single-file account component and an adversarial fixture -- plus
+`tests/masm_test.lua` (navigation), `tests/hover_test.lua` and
+`tests/stack_test.lua` (stack-list notation, instruction arities, the stack
+simulator and its UI) against the fixture project in `tests/fixtures/`,
+which is a miniature Miden workspace -- two namespaced libraries, a renamed
+re-export chain, a kernel library, a single-file account component and an
+adversarial fixture; `tests/fixtures/app/stack.masm` ports the real
+min_burn_amount depth-17 bug as a regression pair -- plus
 `tests/ftplugin_test.lua` for filetype detection and the ftplugin's
 setup/teardown. No Miden checkout or network access is needed, and each
 suite exits non-zero on failure.
@@ -49,6 +52,17 @@ fixtures can evolve.
   tree-sitter here.
 - `lua/masm/hover.lua` - `K` hover: definition-site doc blocks via the
   resolver, instruction docs via the generated reference.
+- `lua/masm/stack.lua` - the stack-analysis engine: procedure segmentation,
+  per-instruction operand-stack simulation, contract cache, checks. UI-free;
+  reasons travel in the result, never through `vim.notify`.
+- `lua/masm/stacknotation.lua` - shared parser for the stack-list notation
+  used by `#! Inputs:/Outputs:` contracts and `# => [...]` comments.
+- `lua/masm/arity.lua` - HAND-AUDITED instruction arities. Not generated:
+  the prose stack effects in `instructions.lua` carry arity errors. Add new
+  instructions here AND to the corpus vocabulary list in
+  `tests/stack_test.lua`.
+- `lua/masm/stackview.lua` - stack-analysis UI: diagnostics publishing,
+  ghost-text overlay, debounce, attach/detach.
 - `lua/masm/instructions.lua` - GENERATED instruction metadata; do not edit.
   Regenerate with `scripts/gen_instructions.py` against a
   [masm-lsp](https://github.com/trailofbits/masm-lsp) checkout when Miden

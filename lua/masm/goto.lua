@@ -1186,6 +1186,39 @@ end
 -- honor the same untrusted-input rules as the index. Not public API.
 M._read_file = read_file
 
+-- Comment/string blanking and cache freshness keys, shared with masm.stack so
+-- the analyzer scans code and invalidates caches by exactly the same rules as
+-- the index. Not public API.
+M._code_only = code_only
+M._stat_key = stat_key
+
+-- Builds a cursor-independent resolver over this buffer's imports and the
+-- project index, for callers (masm.stack) that resolve many invocation
+-- targets per pass: the index and import parse happen once here, each
+-- returned call is then cache-backed. `kind` is the invocation keyword
+-- ("exec"/"call"/"syscall"/"procref"); syscall targets resolve against the
+-- kernel library exactly as cursor resolution would.
+function M.make_resolver(bufpath, buftext)
+  local ok, index = pcall(build_index, bufpath, get_config())
+  if not ok then
+    return nil, "indexing failed: " .. tostring(index)
+  end
+  local mods, syms = parse_imports(buftext)
+  return function(target, kind)
+    local token = target:match("^:*(.-):*$")
+    if not token or token == "" then
+      return nil, "empty target"
+    end
+    local segs = split_path(token)
+    local res_ok, item, reason =
+      pcall(resolve_path, segs, #segs, kind, mods, syms, buftext, bufpath, index)
+    if not res_ok then
+      return nil, tostring(item)
+    end
+    return item, reason
+  end
+end
+
 -- 'tagfunc' implementation. With the 'c' flag (normal-mode <C-]> / gd) the
 -- cursor context drives resolution; otherwise `pattern` (from `:tag foo` or
 -- tag completion) is parsed as a plain path.

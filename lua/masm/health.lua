@@ -21,6 +21,20 @@ function M.check()
     health.error("hover module or instruction reference failed to load")
   end
 
+  local stack_ok = pcall(require, "masm.stack")
+    and pcall(require, "masm.stackview")
+    and pcall(require, "masm.stacknotation")
+    and pcall(require, "masm.arity")
+  if stack_ok then
+    if vim.g.masm_no_stack then
+      health.info("stack analyzer disabled (vim.g.masm_no_stack is set)")
+    else
+      health.ok("stack analyzer loads (diagnostics + :MasmStackToggle overlay)")
+    end
+  else
+    health.error("stack analyzer failed to load")
+  end
+
   if pcall(require, "nvim-treesitter") then
     health.ok("nvim-treesitter is installed")
   else

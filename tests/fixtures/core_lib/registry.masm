@@ -1,0 +1,29 @@
+#! Fixture registry module: exec callees with (and without) stack contracts,
+#! exercised by the stack analyzer tests.
+
+pub const VALUE_SLOT = word("fix::core::registry::value_slot")
+
+#! Gets an item from the registry.
+#!
+#! Inputs:  [slot_id_suffix, slot_id_prefix]
+#! Outputs: [VALUE]
+#!
+#! Invocation: exec
+pub proc get_item
+    padw movup.5 drop movup.4 drop
+end
+
+#! Contract with an ellipsis: callers cannot splice it exactly.
+#!
+#! Inputs:  [x, ...]
+#! Outputs: [x, x, ...]
+#!
+#! Invocation: exec
+pub proc fuzzy_dup
+    dup
+end
+
+# A private helper without any doc contract.
+proc undocumented
+    drop
+end

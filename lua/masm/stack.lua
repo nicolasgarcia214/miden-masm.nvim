@@ -80,6 +80,7 @@ end
 -- state.poisoned: reason string when the suffix is unknowable.
 -- state.bottom: this path diverges (provably-failing assertion).
 -- state.renormalized: a call/dyncall/syscall ran on this path.
+-- state.floor_debt: zeros the 16-floor has pulled in so far (floored mode).
 local function new_state(mode, cells)
   return {
     cells = cells,
@@ -88,32 +89,32 @@ local function new_state(mode, cells)
     poisoned = nil,
     bottom = false,
     renormalized = false,
+    floor_debt = 0,
   }
 end
 
+-- Field-agnostic on purpose (like assign_state below): adding a state field
+-- must not require touching every copy site.
 local function copy_state(state)
+  local copy = {}
+  for k, v in pairs(state) do
+    copy[k] = v
+  end
   local cells = {}
   for i, c in ipairs(state.cells) do
     cells[i] = c
   end
-  return {
-    cells = cells,
-    mode = state.mode,
-    consumed = state.consumed,
-    poisoned = state.poisoned,
-    bottom = state.bottom,
-    renormalized = state.renormalized,
-    floor_debt = state.floor_debt,
-  }
+  copy.cells = cells
+  return copy
 end
 
 -- Guarantees at least n cells, drawing from the zero-fill floor (floored
--- mode) or the caller's stack (relative mode; counted for the underflow
--- check). Returns false when the state got poisoned instead.
+-- mode) or the caller's stack (relative mode; the draw is counted for the
+-- caller-underflow check).
 local function ensure_cells(state, n, ctx, lnum)
   local have = #state.cells
   if have >= n then
-    return true
+    return
   end
   local need = n - have
   if state.mode == "floored" then
@@ -130,21 +131,20 @@ local function ensure_cells(state, n, ctx, lnum)
     end
     state.consumed = state.consumed + need
   end
-  return true
 end
 
--- Restores the 16-element floor after pops (floored mode only).
--- Restores the 16-floor, remembering how many zeros were ever pulled in
--- (`floor_debt`). Corpus authors frequently keep counting the un-pulled
--- view in their trackers, so a claim of `sim - debt` elements is the same
--- stack seen through that convention, not a stale comment.
+-- Restores the 16-element floor after pops (floored mode only), remembering
+-- how many zeros were ever pulled in (`floor_debt`). Corpus authors
+-- frequently keep counting the un-pulled view in their trackers, so a claim
+-- of `sim - debt` elements is the same stack seen through that convention,
+-- not a stale comment.
 local function refloor(state)
   if state.mode == "floored" and #state.cells < 16 then
     local need = 16 - #state.cells
     for _, c in ipairs(zero_cells(need)) do
       state.cells[#state.cells + 1] = c
     end
-    state.floor_debt = (state.floor_debt or 0) + need
+    state.floor_debt = state.floor_debt + need
   end
 end
 
@@ -313,7 +313,6 @@ local function scan_procs(lines, code_only)
         attrs = attrs,
         invocation = invocation,
         inferred_invocation = inferred,
-        is_begin = is_begin,
         diagnostics = {},
         states = {},
       }
@@ -625,8 +624,13 @@ local function apply_push(state, imm, ctx, lnum)
           for lane = 0, 3 do
             pushed[#pushed + 1] = { name = part, lane = lane, origin = "literal", group = group }
           end
-        else
+        elseif width == 1 then
           pushed[#pushed + 1] = { name = part, origin = "literal" }
+        else
+          -- Miden constants are felts or words; any other width means the
+          -- definition was misread. Refuse rather than model it wrong.
+          poison(state, ("constant %s has width %d (not a felt or a word)"):format(part, width))
+          return true
         end
       else
         return nil, ("unrecognized push immediate %q"):format(part)
@@ -682,9 +686,6 @@ local function apply_op(state, tok, ctx, lnum)
   -- `.err=`/.err="..." on assertions annotates the error, not the arity.
   tok = tok:gsub("%.err=.*$", "")
 
-  if tok == "push" then
-    return nil, "push requires an immediate"
-  end
   local base, imm = tok:match("^([%w_]+)%.(.*)$")
   if not base then
     base, imm = tok, nil
@@ -758,10 +759,11 @@ local function apply_op(state, tok, ctx, lnum)
   if base == "dyncall" then
     pop_cells(state, 1, ctx, lnum)
     if state.mode == "relative" then
-      -- dyncall truncates the physical stack to 16, cutting into caller
-      -- territory we cannot see from a relative prefix.
+      -- dyncall truncates the physical stack to 16, cutting into territory
+      -- we cannot see from a relative prefix (whether the proc is
+      -- exec-invoked or a call proc documented in the relative style).
       state.renormalized = true
-      poison(state, "dyncall inside a non-call-invoked procedure")
+      poison(state, "dyncall: the physical stack is only partially visible here")
       return true
     end
     apply_context_call(state, ctx, lnum, nil, "dyncall")
@@ -936,7 +938,7 @@ local function apply_tracker(state, parsed, ctx, lnum)
         break
       end
     end
-    if all_zeros and (extra == (state.floor_debt or 0) or not mentions_pad) then
+    if all_zeros and (extra == state.floor_debt or not mentions_pad) then
       local prefix = notation.expand(parsed)
       for _, c in ipairs(prefix) do
         c.origin = "comment"
@@ -1008,20 +1010,32 @@ local function apply_tracker(state, parsed, ctx, lnum)
   state.cells = cells
 end
 
--- Positional merge of two if/else arm states. Mutates and returns `a`.
+-- Copies every field of `src` over `dst` (clearing fields absent in src),
+-- so a state table can be rebound in place without enumerating its fields.
+local function assign_state(dst, src)
+  for k in pairs(dst) do
+    dst[k] = nil
+  end
+  for k, v in pairs(src) do
+    dst[k] = v
+  end
+end
+
+-- Positional merge of two if/else arm states, merged into `a` in place.
 local function merge_arms(a, b, ctx, lnum)
   if a.bottom then
-    return b
+    assign_state(a, b)
+    return
   end
   if b.bottom then
-    return a
+    return
   end
   a.renormalized = a.renormalized or b.renormalized
   a.consumed = math.max(a.consumed, b.consumed)
-  a.floor_debt = math.max(a.floor_debt or 0, b.floor_debt or 0)
+  a.floor_debt = math.max(a.floor_debt, b.floor_debt)
   if a.poisoned or b.poisoned then
     a.poisoned = a.poisoned or b.poisoned
-    return a
+    return
   end
   if #a.cells ~= #b.cells then
     if a.renormalized then
@@ -1044,7 +1058,7 @@ local function merge_arms(a, b, ctx, lnum)
       )
       poison(a, "branch depths differ")
     end
-    return a
+    return
   end
   local merged = {}
   for i = 1, #a.cells do
@@ -1060,7 +1074,6 @@ local function merge_arms(a, b, ctx, lnum)
     end
   end
   a.cells = merged
-  return a
 end
 
 -- Simulates events from `i` until the block's terminator (`end`, or `else`
@@ -1113,14 +1126,7 @@ sim_block = function(ctx, events, i, state)
           return nil, nil, "malformed if/else nesting"
         end
       end
-      local merged = merge_arms(state, other, ctx, events[ni - 1].lnum)
-      state.cells = merged.cells
-      state.mode = merged.mode
-      state.consumed = merged.consumed
-      state.poisoned = merged.poisoned
-      state.bottom = merged.bottom
-      state.renormalized = merged.renormalized
-      state.floor_debt = merged.floor_debt
+      merge_arms(state, other, ctx, events[ni - 1].lnum)
       ctx.proc.states[events[ni - 1].lnum] = copy_state(state)
       i = ni
     elseif ev.tok == "while.true" then

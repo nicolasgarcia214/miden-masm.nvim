@@ -24,12 +24,20 @@ local mark_ns = vim.api.nvim_create_namespace("masm.stack.overlay")
 
 -- Ghost text must look different from real Comment-highlighted `# =>`
 -- comments so users don't try to edit it; NonText is the dimmer channel.
-vim.api.nvim_set_hl(0, "MasmStackVirtualText", { link = "NonText", default = true })
-vim.api.nvim_set_hl(
-  0,
-  "MasmStackVirtualTextStale",
-  { link = "DiagnosticVirtualTextWarn", default = true }
-)
+-- `:colorscheme` clears plugin-defined groups, so re-apply on ColorScheme.
+local function define_highlights()
+  vim.api.nvim_set_hl(0, "MasmStackVirtualText", { link = "NonText", default = true })
+  vim.api.nvim_set_hl(
+    0,
+    "MasmStackVirtualTextStale",
+    { link = "DiagnosticVirtualTextWarn", default = true }
+  )
+end
+define_highlights()
+vim.api.nvim_create_autocmd("ColorScheme", {
+  group = vim.api.nvim_create_augroup("masm_stack_highlights", { clear = true }),
+  callback = define_highlights,
+})
 
 -- Buffers larger than this are never analyzed (same philosophy as goto's
 -- MAX_FILE_BYTES: no real .masm file approaches it).

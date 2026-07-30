@@ -9,6 +9,7 @@ use {VALUE_SLOT} from fix::core::registry
 const WORD_CONST = word("fix::app::stack::word_const")
 const BRACKET_WORD = [1, 0, 0, 0]
 const FELT_CONST = 7
+const SUBKEY_HI = 11
 
 #! Returns the configured minimum value. BUGGY: drops 3 where 4 are needed.
 #!
@@ -187,4 +188,45 @@ end
 # No doc contract and no Invocation tag: skipped with a reason.
 pub proc unannotated
     push.1 drop
+end
+
+#! Exec whose declared consumption reaches near the 16-floor: the exact exit
+#! depth depends on the callee's internals, so the state must poison and the
+#! next handwritten tracker must resynchronize it. No diagnostics.
+#!
+#! Inputs:  [slot_id_suffix, slot_id_prefix, pad(14)]
+#! Outputs: [VALUE, pad(12)]
+#!
+#! Invocation: call
+pub proc near_floor_poison
+    exec.registry::get_item
+    # => [VALUE, pad(12)]
+end
+
+#! Tracker written in the floor-debt convention: the author keeps counting
+#! the un-pulled view (14 elements) after the floor drew 2 zeros in. The
+#! claim of `sim - debt` elements over an all-zero surplus must be accepted
+#! even though it mentions pad explicitly. No diagnostics.
+#!
+#! Inputs:  [a, b, pad(14)]
+#! Outputs: [pad(16)]
+#!
+#! Invocation: call
+pub proc floor_debt_view
+    drop drop
+    # => [pad(14)]
+end
+
+#! ALL-CAPS tracker element naming a FELT constant, not a word: the sim cell
+#! at that position is an ungrouped felt with a matching name, so the element
+#! must be re-sized to 1 and the tracker adopted. No diagnostics.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [pad(16)]
+#!
+#! Invocation: call
+pub proc caps_felt_const
+    push.SUBKEY_HI
+    # => [SUBKEY_HI, pad(16)]
+    drop
 end

@@ -379,8 +379,9 @@ check(
   diag_at("callee-unresolved", line_of("exec.math::add_checked")) ~= nil
 )
 
--- No other diagnostics: diverge_ok, loop_ok, floor_drop, const_widths and
--- the corrected twin must all be silent.
+-- No other diagnostics: diverge_ok, loop_ok, floor_drop, const_widths, the
+-- corrected twin and the three corpus-rule pins (near_floor_poison,
+-- floor_debt_view, caps_felt_const) must all be silent.
 check("engine: total diagnostic count", #result.diagnostics == 10, tostring(#result.diagnostics))
 
 -- Bails carry reasons; analyzed procs carry states.
@@ -406,6 +407,48 @@ check(
 check(
   "engine: buggy exit is depth 17",
   procs.get_min_value_buggy.exit and #procs.get_min_value_buggy.exit.cells == 17
+)
+
+-- The corpus-tuned semantic rules, pinned as regressions. These were tuned
+-- against the full protocol repo (zero false positives across 849 procs);
+-- a refactor that breaks any of them must fail HERE, not in the field.
+
+-- 1. An exec whose declared consumption reaches near the 16-floor has an
+--    internals-dependent exit depth: poison, then resync at the tracker.
+local nf = procs.near_floor_poison
+local nf_state = nf.states[line_of("exec.registry::get_item", 3)]
+check(
+  "engine: near-floor exec poisons",
+  nf_state ~= nil
+    and nf_state.poisoned ~= nil
+    and nf_state.poisoned:find("callee internals", 1, true) ~= nil,
+  nf_state and tostring(nf_state.poisoned) or "no state"
+)
+check(
+  "engine: near-floor tracker resynchronizes",
+  nf.bailed == nil and nf.exit ~= nil and nf.exit.poisoned == nil and #nf.exit.cells == 16
+)
+
+-- 2. A tracker counting the un-pulled view (claim == sim - floor_debt over
+--    an all-zero surplus) is a convention, not a stale comment.
+local fd = procs.floor_debt_view
+check(
+  "engine: floor-debt tracker accepted",
+  diag_at("comment-stale", line_of("# => [pad(14)]")) == nil
+    and fd.exit ~= nil
+    and fd.exit.floor_debt == 2,
+  fd.exit and tostring(fd.exit.floor_debt) or "no exit"
+)
+
+-- 3. An ALL-CAPS tracker element naming a felt constant re-sizes to 1 felt
+--    when the sim cell at that position is an ungrouped match.
+local caps_lnum = line_of("# => [SUBKEY_HI, pad(16)]")
+check("engine: caps felt-const tracker accepted", diag_at("comment-stale", caps_lnum) == nil)
+local caps_state = procs.caps_felt_const.states[caps_lnum]
+check(
+  "engine: caps felt-const adopted at width 1",
+  caps_state ~= nil and stack.render_cells(caps_state) == "[SUBKEY_HI, pad(16)]",
+  caps_state and stack.render_cells(caps_state) or "no state"
 )
 
 ---------------------------------------------------------------------------

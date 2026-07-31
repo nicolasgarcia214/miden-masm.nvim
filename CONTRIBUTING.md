@@ -19,9 +19,12 @@ Open any `.masm` file to exercise the ftplugin and navigation. Run
 ```
 make test          # navigation test suite (no network needed)
 make test-queries  # builds the pinned grammar, validates the queries
+make lint          # luacheck static analysis (config in .luacheckrc)
+make check         # lua-language-server type check (config in .luarc.json)
+make fmt           # stylua, rewriting in place (CI runs --check and fails)
 ```
 
-`make test` runs eight suites headlessly (`nvim --headless --clean`):
+`make test` runs nine suites headlessly (`nvim --headless --clean`):
 `tests/masm_test.lua` (navigation, references sync and async, rename
 including opcode-named procs and collision refusal, index auto-refresh,
 re-export chain invalidation, config surface, resolver limits, the
@@ -40,10 +43,20 @@ processes; per-port child tracking; nvim-dap registration against a stub
 module), `tests/health_test.lua` (`:checkhealth masm` against stubbed
 reporters, including that the check never mutates state),
 `tests/consistency_test.lua` (the arity table, instruction reference and
-highlight keyword list must agree -- see below) and
+highlight keyword list must agree -- see below),
 `tests/ftplugin_test.lua` for filetype detection and the ftplugin's
-setup/teardown. No Miden checkout, Miden binaries or network access are
-needed, and each suite exits non-zero on failure.
+setup/teardown, and `tests/hardening_test.lua` for the security/robustness
+defenses (`util.read_file`'s size/type refusals, the index walk's symlink,
+depth and entry-cap bounds, `miden-project.toml` path containment,
+references-scan cancellation and the stack simulator's budgets). No Miden
+checkout, Miden binaries or network access are needed, and each suite exits
+non-zero on failure. Suites never touch the tracked fixtures on disk:
+`masm_test.lua` copies `tests/fixtures/` into a temp directory and runs
+against the copy, `hardening_test.lua` builds all of its fixtures in temp
+directories, and both delete them in teardown -- keep new tests to that
+standard, and build them on `tests/helpers.lua` (the shared `check()`,
+fixture-anchored `placer()` and exit-epilogue plumbing every suite loads)
+instead of re-rolling that boilerplate.
 
 `make test-queries` clones and compiles the pinned tree-sitter-masm revision
 (network + C compiler required), then asserts each query in `queries/masm/`
@@ -58,10 +71,28 @@ fixtures can evolve.
 
 ## Layout
 
-- `lua/masm/goto.lua` - all navigation: project index, import parsing,
-  symbol resolution, tagfunc, references (time-sliced scan driver), rename,
-  document symbols, the dialect-drift canary. Resolution is deliberately
-  text-based; see the header comment before reaching for tree-sitter here.
+- `lua/masm/util.lua` - shared low-level helpers, free of project/index
+  knowledge by design: the canonical `$`-inclusive identifier charset
+  (`IDENT_CHARS` and friends -- every identifier pattern must be built from
+  it), MASM path splitting, memoized comment/string blanking
+  (`code_only`/`code_text`), the byte-offset line tracker, hardened bounded
+  file access (`read_file`, `stat_key` freshness keys) and the bounded
+  cache plumbing (full clear on overflow).
+- `lua/masm/project.lua` - the project index: root discovery (git root or
+  outermost `miden-project.toml`), the bounded directory walk with its
+  traversal defenses (symlink skip, depth and entry caps, manifest `path`
+  containment), manifest parsing and the per-index lookup caches.
+- `lua/masm/resolve.lua` - use-statement parsing (all import forms, on raw
+  text) and symbol resolution: local, imported, qualified and kernel
+  targets, `pub use` re-export chains (depth-capped, cycle-checked), plus
+  the dialect-drift canary's unrecognized-import scan. Resolution is
+  deliberately text-based; see the header comment before reaching for
+  tree-sitter here.
+- `lua/masm/goto.lua` - the public navigation facade over `masm.project`
+  and `masm.resolve`: cursor context, tagfunc, references (the time-sliced
+  scan driver), rename, document symbols, and every documented entry point
+  (`resolve()`, `make_resolver()`, the import/interface queries other
+  modules build on).
 - `lua/masm/complete.lua` - 'omnifunc' completion: context detection plus
   candidate enumeration through goto's index and the instruction reference.
 - `lua/masm/dap.lua` - optional nvim-dap integration: launch argv
@@ -70,8 +101,9 @@ fixtures can evolve.
 - `lua/masm/hover.lua` - `K` hover: definition-site doc blocks via the
   resolver, instruction docs via the generated reference.
 - `lua/masm/stack.lua` - the stack-analysis engine: procedure segmentation,
-  per-instruction operand-stack simulation, contract cache, checks. UI-free;
-  reasons travel in the result, never through `vim.notify`.
+  per-instruction operand-stack simulation, contract cache, checks, and the
+  per-procedure memoization (a warm result must be bit-identical to a cold
+  pass). UI-free; reasons travel in the result, never through `vim.notify`.
 - `lua/masm/stacknotation.lua` - shared parser for the stack-list notation
   used by `#! Inputs:/Outputs:` contracts and `# => [...]` comments.
 - `lua/masm/arity.lua` - HAND-AUDITED instruction arities. Not generated:
@@ -100,6 +132,10 @@ fixtures can evolve.
   and would silently discard it.
 - `queries/masm/*.scm` - queries ported from the grammar's Zed-oriented
   bundle to Neovim's conventions.
+- `tests/helpers.lua` - shared suite plumbing: the runtimepath preamble,
+  `check()`, the fixture-anchored `placer()` and the uniform "ALL PASS"
+  exit epilogue. Every suite loads it via `dofile`; suites still run one
+  Neovim process each, so no fixture or cache state crosses suites.
 
 ## Porting queries
 
@@ -121,7 +157,27 @@ query headers.
 ## Style
 
 - Lua is formatted with [StyLua](https://github.com/JohnnyMorganz/StyLua)
-  using the repo's `.stylua.toml` (2-space indent, 100 columns).
+  using the repo's `.stylua.toml` (2-space indent, 100 columns). `make fmt`
+  rewrites in place with the same pinned version CI checks against
+  (`--check` there, so an unformatted file fails the build).
+- `make lint` must pass:
+  [luacheck](https://github.com/lunarmodules/luacheck) with the repo's
+  `.luacheckrc` catches unused locals, accidental globals and shadowing.
+  Install it via your package manager, `luarocks install luacheck`, or the
+  standalone binary from the luacheck releases page (CI pins v1.2.0).
+  Prefix a deliberately unused local or argument with `_` instead of adding
+  inline disables.
+- `make check` must pass:
+  [lua-language-server](https://github.com/LuaLS/lua-language-server)'s
+  `--check` at zero problems, with the repo's `.luarc.json` (the vim API
+  type definitions come from `$VIMRUNTIME/lua`, derived from your installed
+  nvim; CI pins the checker at v3.15.0 and Neovim at v0.12.4, and an older
+  local runtime can report noise CI does not count). Fix findings with real
+  annotation or control-flow improvements (`---@param`/`---@return`,
+  `---@cast`, an early normalize, a restructured guard); a per-line
+  `---@diagnostic disable-next-line` with a stated reason is a last resort
+  for places the checker is genuinely wrong (the tests' deliberate
+  stubbing of `vim.notify` and friends).
 - Comments explain constraints the code cannot show (why an approach is
   required), not what the next line does.
 - Error paths report a reason to the user (`vim.notify`) rather than

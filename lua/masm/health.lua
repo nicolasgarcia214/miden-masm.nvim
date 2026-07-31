@@ -1,6 +1,13 @@
+-- `:checkhealth masm` provider. Reports through vim.health only; it must
+-- never register adapters or commands as a side effect (registration
+-- belongs to the ftplugin).
+
 local M = {}
 
--- `:checkhealth masm`
+-- The `checkhealth` entry point (:h health-dev). Reports module load
+-- status, optional integrations (nvim-dap, debug backends on PATH) and
+-- tree-sitter parser/query health; returns nothing.
+---@return nil
 function M.check()
   local health = vim.health
   health.start("miden-masm.nvim")

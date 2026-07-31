@@ -1,20 +1,22 @@
-*miden-masm.txt*    Miden Assembly support: highlighting and code navigation
+*miden-masm.txt* Miden Assembly: highlighting, navigation, stack analysis, DAP
 
 Author:  Nicolas Garcia
 License: MIT
 
 ==============================================================================
-CONTENTS                                                          *miden-masm*
+CONTENTS                                        *miden-masm* *miden-masm.nvim*
 
   1. Introduction ................................. |miden-masm-introduction|
-  2. Mappings ......................................... |miden-masm-mappings|
-  3. Commands ......................................... |miden-masm-commands|
-  4. Completion ..................................... |miden-masm-completion|
-  5. Stack analysis .................................... |miden-masm-stack|
-  6. Debugger ............................................. |miden-masm-dap|
-  7. Configuration ...................................... |miden-masm-config|
-  8. Name resolution ................................ |miden-masm-resolution|
-  9. Limitations .................................... |miden-masm-limitations|
+  2. Installation ....................................... |miden-masm-install|
+  3. Mappings ......................................... |miden-masm-mappings|
+  4. Commands ......................................... |miden-masm-commands|
+  5. Completion ..................................... |miden-masm-completion|
+  6. Stack analysis .................................... |miden-masm-stack|
+  7. Debugger ............................................. |miden-masm-dap|
+  8. Configuration ...................................... |miden-masm-config|
+  9. API .................................................. |miden-masm-api|
+  10. Name resolution ............................... |miden-masm-resolution|
+  11. Limitations ................................... |miden-masm-limitations|
 
 ==============================================================================
 1. INTRODUCTION                                      *miden-masm-introduction*
@@ -47,7 +49,48 @@ itself.
 Run `:checkhealth masm` to verify the installation.
 
 ==============================================================================
-2. MAPPINGS                                              *miden-masm-mappings*
+2. INSTALLATION                 *miden-masm-install* *miden-masm-requirements*
+
+Requirements:
+
+- Neovim 0.10.4 or newer.
+- nvim-treesitter (https://github.com/nvim-treesitter/nvim-treesitter, main
+  branch) and a C compiler -- only for the optional tree-sitter parser
+  (highlighting, indentation, folds). Navigation, hover, completion and
+  stack analysis are text-based and work without it.
+- nvim-dap (https://github.com/mfussenegger/nvim-dap) plus miden-debug
+  and/or miden-client builds supporting `--start-debug-adapter` -- only for
+  the optional debugger (|miden-masm-dap|).
+
+With lazy.nvim (https://github.com/folke/lazy.nvim): >lua
+    {
+      "nicolasgarcia214/miden-masm.nvim",
+      lazy = false,
+    },
+    {
+      "nvim-treesitter/nvim-treesitter",
+      branch = "main",
+      build = ":TSUpdate",
+    },
+<
+The plugin registers the `masm` parser with nvim-treesitter at startup; run
+`:TSInstall masm` once to compile and install it. The revision is pinned to
+the exact grammar the bundled queries were ported against.
+
+On LazyVim (https://www.lazyvim.org/), which wraps nvim-treesitter and adds
+an `ensure_installed` option upstream does not have, the parser can be
+installed automatically instead: >lua
+    {
+      "nvim-treesitter/nvim-treesitter",
+      opts = function(_, opts)
+        table.insert(opts.ensure_installed, "masm")
+      end,
+    },
+<
+Verify the setup with `:checkhealth masm`.
+
+==============================================================================
+3. MAPPINGS                                              *miden-masm-mappings*
 
 All mappings are buffer-local to `masm` buffers.
 
@@ -78,7 +121,9 @@ grr                Find references to the symbol under the cursor across the
                    usages through renamed imports and re-export chains are
                    included. On a module qualifier, list the `use` statements
                    importing that module instead. The scan runs in the
-                   background (time-sliced on the event loop) and opens the
+                   background (time-sliced on the event loop; the deadline
+                   is checked between files, so a single enormous file is
+                   still scanned in one uninterrupted slice) and opens the
                    quickfix list when it completes; starting a new scan
                    cancels the one in flight.
 
@@ -91,11 +136,12 @@ gO                 List the buffer's definitions (procs, consts, types,
                    submodules, `begin` entrypoint) in the location list.
 
 ==============================================================================
-3. COMMANDS                                              *miden-masm-commands*
+4. COMMANDS                                              *miden-masm-commands*
 
                                                             *:MasmRebuildIndex*
 :MasmRebuildIndex  Drop the cached project index and resolution caches. The
-                   index rebuilds on the next jump. Rarely needed: plain
+                   index rebuilds on the next use (a jump, completion, or
+                   stack-analysis pass). Rarely needed: plain
                    edits are picked up via file mtimes, and saving a new
                    `.masm` file or a `miden-project.toml` from Neovim
                    refreshes the index automatically. Use it after deleting
@@ -134,7 +180,7 @@ gO                 List the buffer's definitions (procs, consts, types,
                    installed. See |miden-masm-dap|.
 
 ==============================================================================
-4. COMPLETION                                          *miden-masm-completion*
+5. COMPLETION                                          *miden-masm-completion*
 
 The ftplugin sets 'omnifunc' (CTRL-X CTRL-O in insert mode). Candidates come
 from the same index and imports navigation uses, so the list is exactly the
@@ -153,7 +199,7 @@ Procedure candidates show the callee's `[inputs] -> [outputs]` doc contract
 in the menu -- the de facto type signature in Miden code.
 
 ==============================================================================
-5. STACK ANALYSIS                                           *miden-masm-stack*
+6. STACK ANALYSIS                                           *miden-masm-stack*
 
 The analyzer simulates the operand stack instruction by instruction inside
 every procedure that declares how it is invoked (`#! Invocation:` doc tag,
@@ -229,7 +275,7 @@ line (`proc f push.1 drop end` -- legal MASM, but events are line-based):
 each bails the procedure with a reason instead of simulating wrongly.
 
 ==============================================================================
-6. DEBUGGER                                                   *miden-masm-dap*
+7. DEBUGGER                                                   *miden-masm-dap*
 
 When nvim-dap (https://github.com/mfussenegger/nvim-dap) is installed, the
 plugin registers a `miden` debug adapter and three default configurations
@@ -264,7 +310,7 @@ the backend's output pipes stay drained for the process's whole lifetime.
 Disable the whole integration with |g:masm_no_dap|.
 
 ==============================================================================
-7. CONFIGURATION                                           *miden-masm-config*
+8. CONFIGURATION                                           *miden-masm-config*
 
                                                                  *g:masm_goto*
 g:masm_goto        Optional table: >lua
@@ -286,9 +332,10 @@ g:masm_no_default_mappings
                    When true, the plugin defines no keymaps; call
                    `require("masm.goto").references()`, `.rename()`,
                    `.document_symbols()` and
-                   `require("masm.hover").hover()` from your own mappings.
-                   'tagfunc' and 'omnifunc' are still set, so CTRL-],
-                   |:tag| and CTRL-X CTRL-O keep working.
+                   `require("masm.hover").hover()` from your own mappings
+                   (see |miden-masm-api|). 'tagfunc' and 'omnifunc' are
+                   still set, so CTRL-], |:tag| and CTRL-X CTRL-O keep
+                   working.
 
                                                         *g:masm_no_treesitter*
 g:masm_no_treesitter
@@ -315,14 +362,131 @@ g:masm_stack       Optional table configuring stack analysis; all fields
                                                              *g:masm_no_stack*
 g:masm_no_stack    When true, stack analysis is not wired at all for new
                    `masm` buffers: no autocmds, no |:MasmStackToggle|, zero
-                   cost.
+                   cost. |masm.stackview.attach()| remains callable, so a
+                   per-project autocmd can still opt chosen buffers in.
 
                                                                *g:masm_no_dap*
 g:masm_no_dap      When true, nothing is registered with nvim-dap and
                    |:MasmDapState| is not defined.
 
 ==============================================================================
-8. NAME RESOLUTION                                     *miden-masm-resolution*
+9. API                                                        *miden-masm-api*
+
+The functions below are the plugin's public Lua surface -- the ones custom
+mappings call when |g:masm_no_default_mappings| is set. Everything else
+under `lua/masm/` (including `_`-prefixed fields) is internal and may
+change.
+
+Multi-return convention: functions documented as returning `item, reason`
+return the value on success, or nil plus a human-readable reason string on
+failure.
+
+resolve()                                               *masm.goto.resolve()*
+    `require("masm.goto").resolve()` resolves the name under the cursor
+    exactly as `gd` would, without jumping. Returns the tag item
+    `{ name, filename, cmd = <lnum>, user_data = "symbol"|"module" }`, or
+    nil and a reason (`item, reason`). Hover (|masm.hover.hover()|) builds
+    on it; custom mappings can too.
+
+references({opts})                                   *masm.goto.references()*
+    `require("masm.goto").references()` finds all references to the symbol
+    (or module) under the cursor and populates the quickfix list,
+    definition first (the `grr` mapping). The scan is asynchronous: the
+    function returns immediately and the quickfix list opens when the scan
+    completes. Pass `{ sync = true }` to block until done; the sync form
+    also returns the quickfix-style items
+    (`{ filename, lnum, col, text }`), or nil when none were found. Note
+    that both forms populate and open the quickfix window as a side
+    effect -- the sync form before returning.
+
+rename({new_name})                                       *masm.goto.rename()*
+    `require("masm.goto").rename()` renames the symbol under the cursor
+    across the project; semantics are those of |:MasmRename|. With
+    {new_name} omitted it prompts via |vim.ui.input| (and returns nothing);
+    with {new_name} given it applies synchronously and returns a summary
+    `{ applied, skipped, files }`, or nil and a reason.
+
+document_symbols()                             *masm.goto.document_symbols()*
+    `require("masm.goto").document_symbols()` lists the buffer's top-level
+    definitions in the location list and opens it (the `gO` mapping).
+    Returns the location-list items, or nothing (after a notification)
+    when the buffer has no definitions.
+
+module_symbols({bufpath}, {segs})                *masm.goto.module_symbols()*
+    `require("masm.goto").module_symbols()` returns the visible interface
+    of the module named by {segs} (a list of path segments, e.g.
+    `{ "std", "math", "u64" }`) as resolved from file {bufpath}: the
+    module's own definitions plus the names it re-exports, as a sorted
+    list of `{ name, kind, path, lnum }`. Returns nil and a reason when
+    the module cannot be resolved.
+
+kernel_symbols({bufpath})                        *masm.goto.kernel_symbols()*
+    `require("masm.goto").kernel_symbols()` returns the interface of the
+    project's kernel library (the `[lib]` with `kind = "kernel"` in its
+    manifest -- what `syscall.` targets resolve against), in the same
+    `{ name, kind, path, lnum }` list shape as
+    |masm.goto.module_symbols()|. Returns nil and a reason when indexing
+    fails or the project declares no kernel library.
+
+clear_cache()                                       *masm.goto.clear_cache()*
+    `require("masm.goto").clear_cache()` drops the cached project index and
+    the resolution caches -- the navigation half of |:MasmRebuildIndex|
+    (the command additionally drops the stack analyzer's memos). Needed
+    after deletions, moves, or changes made outside Neovim; ordinary saves
+    invalidate the affected entries automatically.
+
+hover()                                                  *masm.hover.hover()*
+    `require("masm.hover").hover()` shows the hover float for the name or
+    opcode under the cursor (the `K` mapping). Calling it again while the
+    float is open focuses the float.
+
+analyze_lines({lines}, {path})                  *masm.stack.analyze_lines()*
+    `require("masm.stack").analyze_lines()` runs stack analysis on {lines}
+    (a list of strings) as the content of the file at {path} -- callee
+    contracts resolve relative to that path. Pure with respect to the UI:
+    no notifications, no buffer access. Returns
+    `{ procs = {...}, diagnostics = {...} }` where each diagnostic is
+    `{ lnum, col, severity, code, message }` (1-based `lnum`, severity
+    `"error"`/`"warn"`/`"hint"`, codes as listed in |miden-masm-stack|),
+    or nil and a reason.
+
+analyze({bufnr})                                       *masm.stack.analyze()*
+    `require("masm.stack").analyze()` runs |masm.stack.analyze_lines()| on
+    the current content of buffer {bufnr} (nil or 0 means the current
+    buffer), with the buffer's file name anchoring resolution. Same return
+    convention; an unnamed buffer returns nil and a reason.
+
+toggle({bufnr})                                     *masm.stackview.toggle()*
+    `require("masm.stackview").toggle()` toggles the inferred-stack
+    ghost-text overlay for {bufnr} (nil or 0 means the current buffer) --
+    the function behind |:MasmStackToggle|. A no-op for buffers stack
+    analysis is not attached to (non-masm buffers, or when
+    |g:masm_no_stack| is set).
+
+attach({bufnr})                                     *masm.stackview.attach()*
+    `require("masm.stackview").attach()` wires stack analysis to {bufnr}
+    (nil or 0 means the current buffer): re-analysis is debounced on
+    |InsertLeave| and |TextChanged|, immediate on |BufWritePost|, torn
+    down on |BufUnload|, and a first refresh is scheduled (the file-open
+    path is never blocked). Idempotent per buffer. The ftplugin calls this
+    for every `masm` buffer unless |g:masm_no_stack| is set -- with that
+    set, attach()/detach() are the supported per-buffer opt-in path.
+
+refresh({bufnr})                                   *masm.stackview.refresh()*
+    `require("masm.stackview").refresh()` synchronously re-analyzes {bufnr}
+    (nil or 0 means the current buffer) and republishes the diagnostics,
+    the import canary and the overlay (when enabled). A no-op for buffers
+    not attached; buffers over the 2 MiB analysis gate are refused with a
+    one-time notification.
+
+detach({bufnr})                                     *masm.stackview.detach()*
+    `require("masm.stackview").detach()` detaches stack analysis from
+    {bufnr} (nil or 0 means the current buffer): autocmds and the debounce
+    timer are torn down, the overlay and the published diagnostics are
+    cleared. Idempotent; call |masm.stackview.attach()| to re-enable.
+
+==============================================================================
+10. NAME RESOLUTION                                    *miden-masm-resolution*
 
 The resolver mirrors the Miden assembler's project model:
 
@@ -346,7 +510,7 @@ lookup consulted, so editing ANY hop of a re-export chain re-resolves.
 Deletions, moves and out-of-editor changes need |:MasmRebuildIndex|.
 
 ==============================================================================
-9. LIMITATIONS                                        *miden-masm-limitations*
+11. LIMITATIONS                                       *miden-masm-limitations*
 
 - The pinned tree-sitter grammar (upstream HEAD -- there is nothing newer to
   pin) predates the current dialect: `use {..} from ..`, `pub mod` and
@@ -361,10 +525,12 @@ Deletions, moves and out-of-editor changes need |:MasmRebuildIndex|.
 - A multi-line `use { .. } from` block longer than 40 lines is not
   recognized when the cursor is inside its braces (real-world blocks run to
   ~20 lines).
-- The first jump builds the project index synchronously (one bounded
-  directory walk); reference scans and renames read files as they go, so a
-  very large `extra_roots` still costs time -- but references no longer
-  block the UI while scanning.
+- The project index is one bounded directory walk. It is built by the
+  first stack-analysis pass, scheduled a moment after the first `.masm`
+  buffer opens (stack analysis is on by default); with |g:masm_no_stack|
+  set it is built synchronously on the first jump instead. Reference scans
+  and renames read files as they go, so a very large `extra_roots` still
+  costs time -- but references do not block the UI while scanning.
 - Rename rewrites the definition-site spelling everywhere it appears; it
   does not offer to rename aliases (`use { x as y }` keeps `y`), and it
   cannot know about generated code or docs outside `.masm` files.
@@ -375,11 +541,14 @@ Deletions, moves and out-of-editor changes need |:MasmRebuildIndex|.
   `dynexec`/`dyncall` targets and undocumented `exec` callees make the state
   unknown until the next handwritten `# => [...]` comment; `exec`s that
   reach the 16-element floor have internals-dependent depth and are likewise
-  resynchronized from comments; comments in `exec`-invoked procedures are
-  never flagged (they legitimately mix views); a reordered comment is only
-  caught when both sides are fully named with matching multisets -- renamed
-  elements in the wrong order remain invisible; unknown instructions skip
-  the procedure with a stated reason.
+  resynchronized from comments; elements genuinely consumed from the caller
+  before a later poison go unreported as caller-underflow unless a resync
+  clears the unknown state before the procedure ends (the analyzer never
+  warns on a state it declared unknowable); comments in `exec`-invoked
+  procedures are never flagged (they legitimately mix views); a reordered
+  comment is only caught when both sides are fully named with matching
+  multisets -- renamed elements in the wrong order remain invisible;
+  unknown instructions skip the procedure with a stated reason.
 - Debugging needs nvim-dap plus miden-debug / miden-client builds that
   support `--start-debug-adapter`.
 

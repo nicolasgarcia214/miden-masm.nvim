@@ -5,16 +5,42 @@ on:
     branches: [main]
   pull_request:
 
+# One run per ref: a superseded push cancels the run it obsoleted instead of
+# burning runners on results nobody will read. github.ref keeps PRs and main
+# in separate groups, so a PR push never cancels a main run (or vice versa).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   test:
     strategy:
+      # Let every leg report: a nightly or macOS finding must not cancel the
+      # blocking Linux legs mid-run.
+      fail-fast: false
       matrix:
-        # v0.10.4 is the advertised floor; stable and nightly track current.
-        neovim: [v0.10.4, stable, nightly]
-    runs-on: ubuntu-latest
+        # v0.10.4 is the advertised floor; stable tracks current.
+        os: [ubuntu-latest]
+        neovim: [v0.10.4, stable]
+        experimental: [false]
+        include:
+          # Nightly still runs on every push/PR but is non-blocking
+          # (continue-on-error below): upstream Neovim breakage should
+          # surface in the checks UI without blocking merges.
+          - os: ubuntu-latest
+            neovim: nightly
+            experimental: true
+          # macOS on stable only: the codebase is POSIX-pathed, so this leg
+          # exists to catch BSD-userland/glibc and case-insensitive
+          # filesystem drift, not to re-cover the Neovim version axis.
+          - os: macos-latest
+            neovim: stable
+            experimental: false
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: rhysd/action-setup-vim@febef33995d6649302e9d88dda81e071b68f16a7 # v1
@@ -27,6 +53,80 @@ jobs:
   # the fixtures: a wrong node or field name after a grammar bump would
   # otherwise only surface as an error in users' buffers.
   queries:
+    strategy:
+      matrix:
+        # v0.10.4 is the advertised floor and its older treesitter query
+        # parser can reject constructs stable accepts, so both must pass.
+        neovim: [v0.10.4, stable]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      # The cached artifact is a compiled .so, so the toolchain belongs in
+      # the key: a runner-image bump that changes the system compiler must
+      # rebuild, not restore an object the new toolchain never produced.
+      # hashFiles cannot run commands, hence the step output.
+      - name: Compiler fingerprint for the cache key
+        id: cc
+        run: echo "version=$(cc -dumpversion)" >> "$GITHUB_OUTPUT"
+      # The grammar clone+build is identical for every run on the same pin,
+      # and the Makefile target skips both when the built parser exists.
+      # Keyed on the file carrying the revision pin (plugin/miden-masm.lua,
+      # the Makefile's own source of truth): same hash means same revision,
+      # so a hit can never restore a parser built from another grammar.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: tests/.parser-build
+          key: queries-parser-${{ runner.os }}-cc${{ steps.cc.outputs.version }}-${{ hashFiles('plugin/miden-masm.lua') }}
+      - uses: rhysd/action-setup-vim@febef33995d6649302e9d88dda81e071b68f16a7 # v1
+        with:
+          neovim: true
+          version: ${{ matrix.neovim }}
+      - run: make test-queries
+
+  # Static analysis: catches unused locals, accidental globals, shadowing
+  # and typo'd writes to `vim.*` -- classes of bug the formatting check and
+  # the behavioral tests cannot see. Config lives in .luacheckrc.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install luacheck (pinned by version and checksum)
+        run: |
+          curl -fsSL -o /usr/local/bin/luacheck \
+            https://github.com/lunarmodules/luacheck/releases/download/v1.2.0/luacheck
+          echo "d68da17fca0697d9e2fb04201f3884abd259fa558b3a449bccaed47f1390defc  /usr/local/bin/luacheck" | sha256sum -c -
+          chmod +x /usr/local/bin/luacheck
+      - run: make lint
+
+  # Zero-noise type gate: `lua-language-server --check` against the repo's
+  # .luarc.json must report no problems. The verdict depends on exactly two
+  # inputs -- the checker and the Neovim runtime's bundled type annotations
+  # (workspace.library points at $VIMRUNTIME/lua) -- so BOTH are pinned; a
+  # new checker or Neovim release cannot turn this job red on its own. The
+  # 0.10.4 floor is the test matrix's concern, not this job's: what is
+  # checked here are annotations, not runtime behavior.
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: rhysd/action-setup-vim@febef33995d6649302e9d88dda81e071b68f16a7 # v1
+        with:
+          neovim: true
+          version: v0.12.4
+      - name: Install lua-language-server (pinned by version and checksum)
+        run: |
+          curl -fsSL -o /tmp/luals.tar.gz \
+            https://github.com/LuaLS/lua-language-server/releases/download/3.15.0/lua-language-server-3.15.0-linux-x64.tar.gz
+          echo "4877b874c52fb7587707898da9026cc3a6c854d9bbab115ef49ac4e6a1b88007  /tmp/luals.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/luals"
+          tar -xzf /tmp/luals.tar.gz -C "$HOME/.local/luals"
+          echo "$HOME/.local/luals/bin" >> "$GITHUB_PATH"
+      - run: make check
+
+  # doc/ must generate helptags cleanly (a malformed or duplicate tag would
+  # otherwise only fail on users' machines at install time). The bare
+  # `helptags` command exits 0 even on error, hence the try/cquit wrapper.
+  helptags:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -34,7 +134,8 @@ jobs:
         with:
           neovim: true
           version: stable
-      - run: make test-queries
+      # The generated doc/tags is .gitignore'd; no cleanup needed.
+      - run: nvim --headless -c 'try | helptags doc | catch | cquit 1 | endtry' -c q
 
   stylua:
     runs-on: ubuntu-latest

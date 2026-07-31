@@ -49,16 +49,34 @@ local KEYWORDS = {
 -- Candidate sources
 ---------------------------------------------------------------------------
 
+---@class masm.CompleteItem one 'omnifunc' candidate (:h complete-items)
+---@field word string the completed text
+---@field kind string popup kind letter (see KIND_LETTER; "" when unknown)
+---@field menu string? contract summary / module path / stack effect
+---@field info string? preview-window documentation (opcodes only)
+---@field dup integer 0: never list the same word twice
+
+---@return string bufpath
+---@return string[] lines
+---@return string buftext
 local function buffer_state()
   local bufpath = vim.api.nvim_buf_get_name(0)
   local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
   return bufpath, lines, table.concat(lines, "\n")
 end
 
+---@param items masm.CompleteItem[] appended to in place
+---@param word string
+---@param kind string?
+---@param menu string?
+---@param info string?
 local function add(items, word, kind, menu, info)
   items[#items + 1] = { word = word, kind = kind or "", menu = menu, info = info, dup = 0 }
 end
 
+---@param items masm.CompleteItem[] appended to in place
+---@param symbols {name: string, kind: string?, path: string?, lnum: integer?}[]?
+---@param want_kind string "proc" or "const"
 local function symbol_items(items, symbols, want_kind)
   local stack = require("masm.stack")
   for _, sym in ipairs(symbols or {}) do
@@ -76,6 +94,8 @@ end
 
 -- Resolves the interface of the module an import alias points at, memoized
 -- per completion call (several imported symbols usually share a module).
+---@param bufpath string
+---@return fun(segs: string[]): table[]?
 local function module_lookup(bufpath)
   local memo = {}
   return function(segs)
@@ -90,6 +110,11 @@ end
 -- Candidates for `exec.` / `call.` / `procref.` / `syscall.` / `push.` with
 -- no qualifier yet: local definitions, selectively-imported symbols and
 -- module qualifiers.
+---@param kw string the invocation keyword before the dot
+---@param bufpath string
+---@param lines string[]
+---@param buftext string
+---@return masm.CompleteItem[]
 local function unqualified_items(kw, bufpath, lines, buftext)
   local g = require("masm.goto")
   local stack = require("masm.stack")
@@ -108,8 +133,10 @@ local function unqualified_items(kw, bufpath, lines, buftext)
       end
     end
   else
+    local ident = require("masm.util").IDENT -- `$`-named consts complete too
     for _, line in ipairs(lines) do
-      local name = line:match("^%s*const%s+([%w_]+)") or line:match("^%s*pub%s+const%s+([%w_]+)")
+      local name = line:match("^%s*const%s+(" .. ident .. ")")
+        or line:match("^%s*pub%s+const%s+(" .. ident .. ")")
       if name then
         add(items, name, "v")
       end
@@ -136,15 +163,24 @@ local function unqualified_items(kw, bufpath, lines, buftext)
   return items
 end
 
+---@param kw string the invocation keyword before the dot
+---@param qual string the `mod::`(-chain) qualifier typed so far
+---@param bufpath string
+---@param buftext string
+---@return masm.CompleteItem[]
 local function qualified_items(kw, qual, bufpath, buftext)
   local g = require("masm.goto")
   local path = qual:match("^([%w_:%$]-)::$")
   if not path or path == "" then
     return {}
   end
-  local segs = {}
-  for seg in path:gmatch("[^:]+") do
-    segs[#segs + 1] = seg
+  -- The strict splitter, not `path:gmatch("[^:]+")`: a single `:` is not a
+  -- MASM path separator, and completing through `a:b::` would offer names
+  -- for a module path the assembler rejects (util.split_path returns zero
+  -- segments for malformed paths, so nothing is offered).
+  local segs = require("masm.util").split_path(path)
+  if #segs == 0 then
+    return {}
   end
   local mods = g.buffer_imports(buftext)
   if mods[segs[1]] then
@@ -159,6 +195,7 @@ local function qualified_items(kw, qual, bufpath, buftext)
   return items
 end
 
+---@return masm.CompleteItem[]
 local function opcode_items()
   local items, seen = {}, {}
   for _, e in ipairs(require("masm.instructions")) do
@@ -199,6 +236,11 @@ end
 -- context must be decided here and remembered.
 local before_base
 
+-- 'omnifunc' implementation (see :h complete-functions for the two-call
+-- protocol).
+---@param findstart integer 1 = return the completion start column
+---@param base string the text to complete (second call)
+---@return integer|table[] col_or_matches
 function M.omnifunc(findstart, base)
   if findstart == 1 then
     local line = vim.api.nvim_get_current_line()

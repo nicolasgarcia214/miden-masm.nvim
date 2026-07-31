@@ -6,20 +6,11 @@
 -- a user notices before a test does -- unless this file exists.
 -- Run with: nvim --headless --clean -l tests/consistency_test.lua (or make test)
 
-local script = debug.getinfo(1, "S").source:sub(2)
-local here = vim.fs.dirname(vim.fn.fnamemodify(script, ":p"))
-local plugin_root = vim.fs.dirname(here)
-vim.opt.rtp:prepend(plugin_root)
-
-local failed = 0
-local function check(desc, ok, detail)
-  if ok then
-    print("PASS: " .. desc)
-  else
-    print("FAIL: " .. desc .. (detail and (" -- " .. detail) or ""))
-    failed = failed + 1
-  end
-end
+local helpers = dofile(
+  vim.fs.dirname(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p")) .. "/helpers.lua"
+)
+local plugin_root = helpers.plugin_root
+local check = helpers.check
 
 local arity = require("masm.arity")
 local instructions = require("masm.instructions")
@@ -85,7 +76,4 @@ for _, e in ipairs(instructions) do
 end
 check("no duplicate reference entries", dup == nil, tostring(dup))
 
-print(failed == 0 and "ALL PASS" or (failed .. " FAILURES"))
-if failed > 0 then
-  os.exit(1)
-end
+helpers.finish()

@@ -2,19 +2,10 @@
 -- stubbed to collect reports, so assertions run headlessly on any Neovim.
 -- Run with: nvim --headless --clean -l tests/health_test.lua (or make test)
 
-local script = debug.getinfo(1, "S").source:sub(2)
-local here = vim.fs.dirname(vim.fn.fnamemodify(script, ":p"))
-vim.opt.rtp:prepend(vim.fs.dirname(here))
-
-local failed = 0
-local function check(desc, ok, detail)
-  if ok then
-    print("PASS: " .. desc)
-  else
-    print("FAIL: " .. desc .. (detail and (" -- " .. detail) or ""))
-    failed = failed + 1
-  end
-end
+local helpers = dofile(
+  vim.fs.dirname(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p")) .. "/helpers.lua"
+)
+local check = helpers.check
 
 local function run_check()
   local reports = { ok = {}, error = {}, warn = {}, info = {}, start = {} }
@@ -60,29 +51,28 @@ check("health: no :MasmDapState side effect", vim.fn.exists(":MasmDapState") == 
 -- With nvim-dap present but the adapter not yet registered (no .masm buffer
 -- opened), the check reports that fact -- still without registering.
 local stub = { adapters = {}, configurations = {}, listeners = { after = {} } }
+-- Redefining a loader another suite also stubs is the point of a stub.
+---@diagnostic disable-next-line: duplicate-set-field
 package.preload["dap"] = function()
   return stub
 end
-call_ok, reports = run_check()
+reports = select(2, run_check())
 check("health: unregistered adapter is an info", any(reports.info, "not registered yet"))
 check("health: adapter NOT registered by the check", stub.adapters.miden == nil)
 
 -- Once the ftplugin has registered (simulated), the check reports ok.
 stub.adapters.miden = function() end
-call_ok, reports = run_check()
+reports = select(2, run_check())
 check("health: registered adapter is an ok", any(reports.ok, "adapter registered"))
 
 -- Opt-out flags surface as info, not errors.
 vim.g.masm_no_stack = true
 vim.g.masm_no_dap = true
-call_ok, reports = run_check()
+reports = select(2, run_check())
 check("health: masm_no_stack is an info", any(reports.info, "stack analyzer disabled"))
 check("health: masm_no_dap is an info", any(reports.info, "debugger integration disabled"))
 check("health: opt-outs produce no errors", #reports.error == 0)
 vim.g.masm_no_stack = nil
 vim.g.masm_no_dap = nil
 
-print(failed == 0 and "ALL PASS" or (failed .. " FAILURES"))
-if failed > 0 then
-  os.exit(1)
-end
+helpers.finish()

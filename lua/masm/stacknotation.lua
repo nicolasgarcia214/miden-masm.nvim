@@ -19,9 +19,39 @@
 
 local M = {}
 
+---@class masm.NotationElem one element of a stack list
+---@field name string as spelled (nested lists/braces keep the full spelling)
+---@field width integer felts this element occupies
+---@field kind '"felt"'|'"word"'|'"span"'|'"pad"'
+---@field elems masm.NotationElem[]? nested `[..]` contents (span only)
+---@field names string[]? per-felt names from a `prefix{a,b}` expansion
+
+---@class masm.NotationList a parsed `[...]` stack list
+---@field elems masm.NotationElem[]
+---@field width integer total felts
+---@field lower_bound boolean a trailing `...` made the width a minimum
+
+---@class masm.NotationContract parsed `#!` doc-block contract. For each of
+--- inputs/outputs: the parsed list, or a `_reason` why it did not parse
+--- (declared-but-unparseable is distinct from not declared at all); `_idx`
+--- is the declaring line's 1-based index into the doc block and `_raw` the
+--- author's own `[..]` spelling.
+---@field inputs masm.NotationList?
+---@field inputs_reason string?
+---@field inputs_idx integer?
+---@field inputs_raw string?
+---@field outputs masm.NotationList?
+---@field outputs_reason string?
+---@field outputs_idx integer?
+---@field outputs_raw string?
+---@field invocation string? the `#! Invocation:` value, verbatim
+
 -- Maximum comment continuation lines joined while looking for a closing `]`.
 -- The longest legitimate wrap in the protocol corpus is 5 lines.
+-- Exported: masm.stack's per-proc memo key must cover every line join_value
+-- could read past a procedure's `end`, so the two bounds must agree.
 local MAX_JOIN_LINES = 10
+M.MAX_JOIN_LINES = MAX_JOIN_LINES
 
 ---------------------------------------------------------------------------
 -- Element classification
@@ -179,6 +209,9 @@ parse_elems = function(interior)
 end
 
 -- Parses a full `[...]` list (brackets included). Public for tests.
+---@param s string
+---@return masm.NotationList? parsed
+---@return string? reason
 function M.parse_list(s)
   local body = trim(s)
   local interior = body:match("^%[(.*)%]$")
@@ -196,6 +229,11 @@ end
 -- notation is written top-first). Cells are immutable once created; a shared
 -- `group` table marks felts that belong together (a word or a pad/span run)
 -- so the renderer can compress them back to `ASSET` / `pad(N)` notation.
+-- The param is structural, not masm.NotationList: only `elems` is read, and
+-- masm.stack's comment-adoption path passes a synthesized one-element list
+-- without the width/lower_bound bookkeeping fields.
+---@param parsed {elems: masm.NotationElem[]}
+---@return masm.StackCell[] cells one per felt, top of stack first
 function M.expand(parsed)
   local cells = {}
   for _, elem in ipairs(parsed.elems) do
@@ -234,22 +272,48 @@ end
 -- Returns the comment part of a raw line (text after `#`, `#` included) and
 -- its byte column, honoring string literals the same way goto's code_only
 -- does. nil when the line has no comment.
+---@param line string
+---@return string? comment
+---@return integer? col 1-based byte column of the `#`
 function M.comment_part(line)
-  local in_str, esc = false, false
-  for i = 1, #line do
-    local c = line:sub(i, i)
-    if in_str then
-      if esc then
-        esc = false
-      elseif c == "\\" then
-        esc = true
-      elseif c == '"' then
-        in_str = false
+  -- Fast paths first, exactly like util.code_only's rewrite: this runs on
+  -- every line of every analyzed proc on each refresh, and the per-byte
+  -- state machine it replaces was the same profile hazard code_only shed.
+  -- String literals are rare in real .masm (error messages only), so almost
+  -- every line either has no `#` at all or its first `#` precedes any `"`.
+  local hash = line:find("#", 1, true)
+  if not hash then
+    return nil
+  end
+  local quote = line:find('"', 1, true)
+  if not quote or hash < quote then
+    return line:sub(hash), hash
+  end
+  -- Slow path (a string literal opens before any `#`): walk SEGMENTS with
+  -- find instead of bytes with sub. Outside a string, jump to the next `"`
+  -- or `#` -- a `#` is the comment; inside a string, jump to the closing
+  -- quote, where a `\` escape consumes the following character so an
+  -- escaped `"` cannot close.
+  local pos, n = 1, #line
+  while pos <= n do
+    local q = line:find('[#"]', pos)
+    if not q then
+      return nil
+    end
+    if line:sub(q, q) == "#" then
+      return line:sub(q), q
+    end
+    pos = q + 1
+    while true do
+      local e = line:find('[\\"]', pos)
+      if not e then
+        return nil -- unterminated string: the rest is literal content
       end
-    elseif c == '"' then
-      in_str = true
-    elseif c == "#" then
-      return line:sub(i), i
+      if line:sub(e, e) == '"' then
+        pos = e + 1
+        break
+      end
+      pos = e + 2 -- the escaped character
     end
   end
   return nil
@@ -259,6 +323,9 @@ end
 --   "tracker", value  -- `# => ...` or `# OS => ...` (value = text after `=>`)
 --   "other-stack"     -- `# AS/AM/LM => ...` (advice/local state: not ours)
 --   nil               -- any other comment
+---@param comment string the comment part of a line (`#` included)
+---@return ('"tracker"'|'"other-stack"')? kind
+---@return string? value text after `=>` ("tracker" only)
 function M.tracker_kind(comment)
   local rest = comment:match("^#!?%s*(.*)$")
   if not rest then
@@ -282,7 +349,13 @@ end
 -- `first` is the text after `=>` (or after `Inputs:`); `lines` is the buffer
 -- array and `lnum` the line the value starts on. Continuation lines must be
 -- comment-only (`#` or `#!` prefixed); their prefix and indentation are
--- stripped. Returns joined_value, last_lnum or nil, reason.
+-- stripped.
+---@param first string text after `=>` (or after `Inputs:`)
+---@param lines string[] the buffer (or doc-block) line array
+---@param lnum integer line the value starts on (index into `lines`)
+---@return string? joined_value
+---@return (integer|string)? last_lnum_or_reason last line consumed, or the
+---   refusal reason when the first return is nil
 function M.join_value(first, lines, lnum)
   local value = first
   local last = lnum
@@ -332,6 +405,8 @@ end
 -- Returns { inputs, inputs_reason, inputs_idx, outputs, outputs_reason,
 -- outputs_idx, invocation }; the `_idx` fields are 1-based indices into
 -- doc_lines so callers can place diagnostics on the declaring line.
+---@param doc_lines string[] the `#!` block directly above a declaration
+---@return masm.NotationContract
 function M.contract(doc_lines)
   local out = {}
   for i, line in ipairs(doc_lines) do

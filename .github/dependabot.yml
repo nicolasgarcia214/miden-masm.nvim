@@ -1,0 +1,9 @@
+# The workflow actions in .github/workflows/ are pinned to full commit SHAs;
+# Dependabot is what moves those digests forward (it updates the SHA and the
+# trailing version comment together). Weekly is plenty for this repo's pace.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

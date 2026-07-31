@@ -4,23 +4,13 @@
 --   nvim --headless --clean -l tests/stack_test.lua
 -- or `make test`.
 
-local script = debug.getinfo(1, "S").source:sub(2)
-local here = vim.fs.dirname(vim.fn.fnamemodify(script, ":p"))
-local plugin_root = vim.fs.dirname(here)
-vim.opt.rtp:prepend(plugin_root)
+local helpers = dofile(
+  vim.fs.dirname(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p")) .. "/helpers.lua"
+)
+local here = helpers.here
+local check = helpers.check
 
 local notation = require("masm.stacknotation")
-
-local failed = 0
-
-local function check(desc, ok, detail)
-  if ok then
-    print("PASS: " .. desc)
-  else
-    print("FAIL: " .. desc .. (detail and (" -- " .. detail) or ""))
-    failed = failed + 1
-  end
-end
 
 ---------------------------------------------------------------------------
 -- stacknotation: element sizing
@@ -69,7 +59,7 @@ check("notation: prose refused", (notation.parse_list("[<values returned>]")) ==
 check("notation: unbalanced refused", (notation.parse_list("[a, b")) == nil)
 
 -- Expansion into per-felt cells.
-local cells = notation.expand(notation.parse_list("[VALUE, pad(2), amount]"))
+local cells = notation.expand(assert(notation.parse_list("[VALUE, pad(2), amount]")))
 check("notation: expand widths", #cells == 7)
 check("notation: expand word lanes", cells[1].name == "VALUE" and cells[1].lane == 0)
 check("notation: expand shared word group", cells[1].group == cells[4].group)
@@ -86,6 +76,19 @@ check(
   "notation: hash inside string is not a comment",
   (notation.comment_part('const E = "a # b"')) == nil
 )
+-- The fast-path/segment rewrite's edge cases, pinned (verified against the
+-- old per-byte implementation by a corpus + 50k-case differential fuzz).
+comment, col = notation.comment_part('const E = "a # b" # real')
+check("notation: comment after a string with a hash", comment == "# real" and col == 19)
+check(
+  "notation: escaped quote cannot close the string",
+  (notation.comment_part('const E = "a \\" # not closed')) == nil
+)
+comment, col = notation.comment_part('const E = "esc\\\\" # yes')
+check("notation: escaped backslash still closes", comment == "# yes" and col == 19)
+comment, col = notation.comment_part("#! doc line")
+check("notation: line-leading `#!` extracted whole", comment == "#! doc line" and col == 1)
+check("notation: no comment yields nil", (notation.comment_part("push.1 drop")) == nil)
 
 local kind, value = notation.tracker_kind("# => [a, b]")
 check("notation: `# =>` is a tracker", kind == "tracker" and value == "[a, b]")
@@ -325,6 +328,10 @@ end
 
 local result, reason = stack.analyze(bufnr)
 check("engine: fixture analyzes", result ~= nil, tostring(reason))
+-- Everything below dereferences the result, so a failed analysis is fatal
+-- to the whole block anyway; failing here names the reason instead of
+-- erroring on the first nil index (and narrows the type for the checker).
+result = assert(result, tostring(reason))
 
 local by_code = {}
 local function diag_at(code, lnum)
@@ -603,6 +610,204 @@ check(
   vres and vres.procs[1] and tostring(vres.procs[1].bailed) or "no result"
 )
 
+-- Bases absent from SPECIAL_RANGE take no index at all (the reference
+-- documents swapdw/reversew/reversedw bare only): an immediate must bail
+-- exactly like movup.99, never be silently accepted.
+for _, bad in ipairs({ "swapdw.3", "reversew.9", "reversedw.1" }) do
+  vres = analyze_virtual({
+    "#! Invocation: call",
+    "#! Inputs:  [pad(16)]",
+    "#! Outputs: [pad(16)]",
+    "proc no_imm_op",
+    "    " .. bad,
+    "end",
+  })
+  local no_imm = vres and vres.procs[1]
+  check(
+    "positional range: " .. bad .. " bails with a reason",
+    no_imm ~= nil
+      and no_imm.bailed ~= nil
+      and no_imm.bailed:find("no index immediate", 1, true) ~= nil
+      and #vres.diagnostics == 0,
+    no_imm and tostring(no_imm.bailed) or "no proc"
+  )
+end
+
+-- ...while the bare forms keep simulating (all net 0 at depth 16).
+vres = analyze_virtual({
+  "#! Invocation: call",
+  "#! Inputs:  [pad(16)]",
+  "#! Outputs: [pad(16)]",
+  "proc bare_shuffles",
+  "    swapdw",
+  "    reversew",
+  "    reversedw",
+  "end",
+})
+check(
+  "positional range: bare swapdw/reversew/reversedw still simulated",
+  vres ~= nil and vres.procs[1] ~= nil and vres.procs[1].bailed == nil and #vres.diagnostics == 0,
+  vres and vres.procs[1] and tostring(vres.procs[1].bailed) or "no result"
+)
+
+-- `emit` flows through arity.ops (not the decorator intercept): both forms
+-- are net 0, so a depth-16 proc stays clean.
+vres = analyze_virtual({
+  "#! Invocation: call",
+  "#! Inputs:  [pad(16)]",
+  "#! Outputs: [pad(16)]",
+  "proc emits",
+  "    emit.event::something",
+  "    emit",
+  "end",
+})
+check(
+  "arity: emit bare and immediate simulate as net 0",
+  vres ~= nil and vres.procs[1] ~= nil and vres.procs[1].bailed == nil and #vres.diagnostics == 0,
+  vres and vres.procs[1] and tostring(vres.procs[1].bailed) or "no result"
+)
+
+---------------------------------------------------------------------------
+-- engine: unterminated procedures (missing `end`)
+---------------------------------------------------------------------------
+
+-- A proc missing its `end` must not swallow the declarations below it: the
+-- next `proc` line ends it as unterminated, it gets a real WARN diagnostic
+-- (an end-less proc is a syntax error the assembler rejects, so this can
+-- never false-positive on valid code -- the corpus oracle pins that), and
+-- every proc below still analyzes with its own diagnostics intact.
+vres = analyze_virtual({
+  "#! Invocation: call",
+  "#! Inputs:  [pad(16)]",
+  "#! Outputs: [pad(16)]",
+  "proc unterminated_mid",
+  "    push.1",
+  "",
+  "#! Invocation: call",
+  "#! Inputs:  [b, a, pad(14)]",
+  "#! Outputs: [a, b, pad(14)]",
+  "proc below_unterminated",
+  "    swap",
+  "    # => [a, b, pad(15)]",
+  "end",
+})
+local unterminated, below
+for _, p in ipairs(vres and vres.procs or {}) do
+  if p.name == "unterminated_mid" then
+    unterminated = p
+  elseif p.name == "below_unterminated" then
+    below = p
+  end
+end
+check(
+  "missing end: proc bails with the missing-end reason",
+  unterminated ~= nil
+    and unterminated.end_lnum == nil
+    and unterminated.bailed ~= nil
+    and unterminated.bailed:find("missing", 1, true) ~= nil,
+  unterminated and tostring(unterminated.bailed) or "proc not scanned"
+)
+local missing_end_diag
+for _, d in ipairs(vres and vres.diagnostics or {}) do
+  if d.code == "missing-end" then
+    missing_end_diag = d
+  end
+end
+check(
+  "missing end: real WARN diagnostic on the declaration line",
+  missing_end_diag ~= nil and missing_end_diag.severity == "warn" and missing_end_diag.lnum == 4,
+  vim.inspect(missing_end_diag)
+)
+local below_stale
+for _, d in ipairs(vres and vres.diagnostics or {}) do
+  if d.code == "comment-stale" and d.lnum == 12 then
+    below_stale = d
+  end
+end
+check(
+  "missing end: proc below still analyzed, own end, own diagnostics",
+  below ~= nil and below.bailed == nil and below.end_lnum == 13 and below_stale ~= nil,
+  below and (tostring(below.bailed) .. "/" .. tostring(below.end_lnum)) or "proc not scanned"
+)
+check(
+  "missing end: exactly the two expected diagnostics",
+  vres ~= nil and #vres.diagnostics == 2,
+  vres and tostring(#vres.diagnostics)
+)
+
+-- The in-progress-typing shape: a bare `proc` line (no body, no doc block
+-- yet) above existing procs. The new proc warns; everything below is
+-- untouched. No invocation annotation is needed for the warn -- the syntax
+-- error stands on its own.
+vres = analyze_virtual({
+  "proc being_typed",
+  "",
+  "#! Invocation: call",
+  "#! Inputs:  [b, a, pad(14)]",
+  "#! Outputs: [a, b, pad(14)]",
+  "proc existing_below",
+  "    swap",
+  "end",
+})
+local typed, existing
+for _, p in ipairs(vres and vres.procs or {}) do
+  if p.name == "being_typed" then
+    typed = p
+  elseif p.name == "existing_below" then
+    existing = p
+  end
+end
+check(
+  "missing end: freshly typed proc line warns without an Invocation tag",
+  typed ~= nil
+    and typed.bailed ~= nil
+    and vres ~= nil
+    and #vres.diagnostics == 1
+    and vres.diagnostics[1].code == "missing-end"
+    and vres.diagnostics[1].lnum == 1,
+  vres and vim.inspect(vres.diagnostics) or "no result"
+)
+check(
+  "missing end: existing proc below stays clean",
+  existing ~= nil and existing.bailed == nil and existing.end_lnum == 8,
+  existing and (tostring(existing.bailed) .. "/" .. tostring(existing.end_lnum)) or "not scanned"
+)
+
+-- A trailing proc with neither an `end` nor a following declaration still
+-- warns (it runs to end-of-file, as before).
+vres = analyze_virtual({
+  "#! Invocation: call",
+  "#! Inputs:  [pad(16)]",
+  "#! Outputs: [pad(16)]",
+  "proc trailing_unterminated",
+  "    push.1",
+})
+check(
+  "missing end: trailing unterminated proc warns too",
+  vres ~= nil
+    and #vres.diagnostics == 1
+    and vres.diagnostics[1].code == "missing-end"
+    and vres.diagnostics[1].lnum == 4,
+  vres and vim.inspect(vres.diagnostics) or "no result"
+)
+
+---------------------------------------------------------------------------
+-- engine: empty input edge cases
+---------------------------------------------------------------------------
+
+vres = analyze_virtual({})
+check(
+  "empty input: zero lines analyze to an empty result",
+  vres ~= nil and #vres.procs == 0 and #vres.diagnostics == 0,
+  vres and vim.inspect(vres) or "nil result"
+)
+vres = analyze_virtual({ "" })
+check(
+  "empty input: a single empty line analyzes to an empty result",
+  vres ~= nil and #vres.procs == 0 and #vres.diagnostics == 0,
+  vres and vim.inspect(vres) or "nil result"
+)
+
 ---------------------------------------------------------------------------
 -- engine: begin..end entrypoint blocks are analyzed (floored, 16-element)
 ---------------------------------------------------------------------------
@@ -656,6 +861,256 @@ check(
 )
 
 ---------------------------------------------------------------------------
+-- engine: per-procedure memoization
+---------------------------------------------------------------------------
+
+-- The memo must be invisible in results (the corpus oracle pins that); these
+-- tests pin WHICH procs re-analyze, via the exposed hit/miss counters.
+local function reset_memo_stats()
+  stack._memo_stats.hits, stack._memo_stats.misses = 0, 0
+end
+
+local memo_src = {
+  "#! Invocation: exec",
+  "#! Inputs:  [a, b]",
+  "#! Outputs: [sum]",
+  "proc callee_memo",
+  "    add",
+  "end",
+  "",
+  "#! Invocation: exec",
+  "#! Inputs:  [a, b]",
+  "#! Outputs: [sum]",
+  "proc caller_memo",
+  "    exec.callee_memo",
+  "end",
+}
+stack.clear_cache()
+analyze_virtual(memo_src) -- populate the memo
+reset_memo_stats()
+analyze_virtual(memo_src)
+check(
+  "memo: unchanged procs all hit",
+  stack._memo_stats.hits == 2 and stack._memo_stats.misses == 0,
+  stack._memo_stats.hits .. "/" .. stack._memo_stats.misses
+)
+
+-- (i) A body edit invalidates exactly the edited proc; the sibling still
+-- hits (its own text and its view of the callee CONTRACT are unchanged).
+local body_edit = vim.deepcopy(memo_src)
+body_edit[5] = "    swap add"
+reset_memo_stats()
+analyze_virtual(body_edit)
+check(
+  "memo: edited proc re-analyzes, untouched sibling hits",
+  stack._memo_stats.hits == 1 and stack._memo_stats.misses == 1,
+  stack._memo_stats.hits .. "/" .. stack._memo_stats.misses
+)
+
+-- (ii) Editing the CALLEE's Outputs contract must re-analyze the caller
+-- too: the caller's cached result depends on the contract it spliced in
+-- (the cross-proc dependency the dep signatures exist for).
+local out_edit = vim.deepcopy(memo_src)
+out_edit[3] = "#! Outputs: [sum, carry]"
+reset_memo_stats()
+local ores = analyze_virtual(out_edit)
+check(
+  "memo: callee Outputs change re-analyzes the caller",
+  stack._memo_stats.hits == 0 and stack._memo_stats.misses == 2,
+  stack._memo_stats.hits .. "/" .. stack._memo_stats.misses
+)
+-- ...and the re-analysis is real: the caller's body now leaves one element
+-- but its own Outputs still declare one while the callee delivers two.
+local caller_net
+for _, d in ipairs(ores and ores.diagnostics or {}) do
+  if d.code == "exec-net" and d.lnum == 13 then
+    caller_net = d
+  end
+end
+check(
+  "memo: stale caller diagnostic replaced after contract change",
+  caller_net ~= nil,
+  vim.inspect(ores and ores.diagnostics)
+)
+
+---------------------------------------------------------------------------
+-- engine: poisoned states and the caller-underflow tally
+---------------------------------------------------------------------------
+
+-- An undocumented exec callee poisons the state; the draws the later drops
+-- make are phantom cells from an unknowable suffix, not the caller's declared
+-- Inputs -- they must not count toward caller-underflow (which used to fire
+-- here, on a state the analyzer had itself declared unknowable).
+local poisoned_draws_src = {
+  "#! Invocation: exec",
+  "#! Inputs:  [a]",
+  "#! Outputs: []",
+  "proc poisoned_draws",
+  "    exec.nowhere::missing",
+  "    drop drop drop",
+  "end",
+}
+vres = analyze_virtual(poisoned_draws_src)
+local function codes_of(res)
+  local out = {}
+  for _, d in ipairs(res and res.diagnostics or {}) do
+    out[#out + 1] = d.code
+  end
+  return table.concat(out, ",")
+end
+check(
+  "poison: no caller-underflow from draws under a poison",
+  vres ~= nil and codes_of(vres) == "callee-unresolved",
+  codes_of(vres)
+)
+-- Warm pass must replay the identical outcome (memo lockstep).
+vres = analyze_virtual(poisoned_draws_src)
+check(
+  "poison: warm pass replays the same outcome",
+  vres ~= nil and codes_of(vres) == "callee-unresolved",
+  codes_of(vres)
+)
+
+-- The recovery the callee-unresolved hint promises must actually recover:
+-- after the `# => [...]` resync nothing consumed-based may linger (the
+-- phantom draws left no tally to trip over).
+vres = analyze_virtual({
+  "#! Invocation: exec",
+  "#! Inputs:  [a]",
+  "#! Outputs: [b]",
+  "proc resync_after_poison",
+  "    exec.nowhere::missing",
+  "    drop drop",
+  "    # => [b]",
+  "end",
+})
+local resynced = vres and vres.procs[1]
+check(
+  "poison: tracker resync leaves no residual consumed diagnostics",
+  vres ~= nil and codes_of(vres) == "callee-unresolved",
+  codes_of(vres)
+)
+check(
+  "poison: resynced exit is clean (unpoisoned, tally zeroed)",
+  resynced ~= nil
+    and resynced.exit ~= nil
+    and resynced.exit.poisoned == nil
+    and resynced.exit.consumed == 0
+    and #resynced.exit.cells == 1,
+  resynced and vim.inspect(resynced.exit) or "no proc"
+)
+
+-- The happy path stays detected: a genuine (unpoisoned) draw beyond the
+-- declared Inputs still warns, at the line of the first draw.
+vres = analyze_virtual({
+  "#! Invocation: exec",
+  "#! Inputs:  [a]",
+  "#! Outputs: []",
+  "proc real_underflow",
+  "    drop drop",
+  "end",
+})
+local real_cu = vres and vres.diagnostics[1]
+check(
+  "poison: genuine caller-underflow still fires",
+  vres ~= nil
+    and #vres.diagnostics == 1
+    and real_cu.code == "caller-underflow"
+    and real_cu.lnum == 5
+    and real_cu.message:find("1 element", 1, true) ~= nil,
+  vres and vim.inspect(vres.diagnostics) or "no result"
+)
+
+---------------------------------------------------------------------------
+-- engine: the lookup budget counts distinct targets, not raw calls
+---------------------------------------------------------------------------
+
+-- 400+ raw lookups of ONE constant are a single distinct target: the budget
+-- must not exhaust, and the genuine depth-17 exit at the end of the file
+-- must surface as an ERROR (under total counting it silently degraded to a
+-- budget poison and a hidden hint).
+local repeat_src = { "const REPEATED = 7", "" }
+for p = 1, 40 do
+  vim.list_extend(repeat_src, {
+    "#! Invocation: call",
+    "#! Inputs:  [pad(16)]",
+    "#! Outputs: [pad(16)]",
+    "proc repeats_" .. p,
+  })
+  for _ = 1, 10 do
+    repeat_src[#repeat_src + 1] = "    push.REPEATED"
+    repeat_src[#repeat_src + 1] = "    drop"
+  end
+  vim.list_extend(repeat_src, { "end", "" })
+end
+vim.list_extend(repeat_src, {
+  "#! Invocation: call",
+  "#! Inputs:  [pad(16)]",
+  "#! Outputs: [pad(16)]",
+  "proc deep_exit",
+  "    push.REPEATED",
+  "end",
+})
+stack.clear_cache()
+vres = analyze_virtual(repeat_src)
+local deep_diag = vres and vres.diagnostics[1]
+check(
+  "budget: repeated lookups of one target never exhaust it",
+  vres ~= nil
+    and #vres.diagnostics == 1
+    and deep_diag.code == "exit-depth"
+    and deep_diag.severity == "error"
+    and deep_diag.lnum == #repeat_src,
+  vres and vim.inspect(vres.diagnostics) or "no result"
+)
+-- Warm pass: the deps replay must reproduce the distinct-target accounting
+-- (every proc hits the memo, the error stays, nothing new appears).
+reset_memo_stats()
+vres = analyze_virtual(repeat_src)
+check(
+  "budget: warm pass replays distinct accounting (all procs hit)",
+  stack._memo_stats.misses == 0 and vres ~= nil and codes_of(vres) == "exit-depth",
+  stack._memo_stats.hits .. "/" .. stack._memo_stats.misses .. " " .. codes_of(vres)
+)
+
+-- Exhaustion by genuinely DISTINCT targets still degrades gracefully, with
+-- the stated budget reason -- never a guessed width.
+local distinct_src = {}
+for i = 1, 305 do
+  distinct_src[#distinct_src + 1] = ("const C%d = %d"):format(i, i)
+end
+vim.list_extend(distinct_src, {
+  "",
+  "#! Invocation: exec",
+  "#! Inputs:  []",
+  "#! Outputs: []",
+  "proc exhausts_budget",
+})
+for i = 1, 305 do
+  distinct_src[#distinct_src + 1] = "    push.C" .. i
+  distinct_src[#distinct_src + 1] = "    drop"
+end
+distinct_src[#distinct_src + 1] = "end"
+stack.clear_cache()
+vres = analyze_virtual(distinct_src)
+local exhausted
+for _, p in ipairs(vres and vres.procs or {}) do
+  if p.name == "exhausts_budget" then
+    exhausted = p
+  end
+end
+check(
+  "budget: distinct-target exhaustion poisons with the stated reason",
+  exhausted ~= nil
+    and exhausted.bailed == nil
+    and exhausted.exit ~= nil
+    and exhausted.exit.poisoned ~= nil
+    and exhausted.exit.poisoned:find("budget exhausted", 1, true) ~= nil,
+  exhausted and tostring(exhausted.exit and exhausted.exit.poisoned) or "no proc"
+)
+stack.clear_cache()
+
+---------------------------------------------------------------------------
 -- stackview: diagnostics publishing, config gates, overlay extmarks
 ---------------------------------------------------------------------------
 
@@ -702,6 +1157,36 @@ vim.g.masm_stack = { diagnostics = false }
 stackview.refresh(bufnr)
 check("view: diagnostics=false publishes nothing", #published() == 0)
 vim.g.masm_stack = nil
+
+-- Invalid config fields degrade loudly to the defaults: publishing still
+-- works (diagnostics = "yes" is not `false`), and each bad field notifies
+-- by name (previously `overlay_mode = true` silently disabled the "auto"
+-- gating and `debounce_ms = "300"` worked only through luv coercion).
+local cfg_notified = {}
+local saved_notify = vim.notify
+-- Replacing the typed built-in is the point of the stub; restored below.
+---@diagnostic disable-next-line: duplicate-set-field
+vim.notify = function(msg)
+  cfg_notified[#cfg_notified + 1] = tostring(msg)
+end
+vim.g.masm_stack = { diagnostics = "yes", overlay_mode = true, debounce_ms = "300" }
+stackview.refresh(bufnr)
+vim.notify = saved_notify
+vim.g.masm_stack = nil
+check("view: invalid config falls back to publishing defaults", #published() == 9)
+local cfg_mentions = { diagnostics = false, overlay_mode = false, debounce_ms = false }
+for _, msg in ipairs(cfg_notified) do
+  for field in pairs(cfg_mentions) do
+    if msg:find("masm_stack." .. field, 1, true) then
+      cfg_mentions[field] = true
+    end
+  end
+end
+check(
+  "view: each invalid config field notifies by name",
+  cfg_mentions.diagnostics and cfg_mentions.overlay_mode and cfg_mentions.debounce_ms,
+  vim.inspect(cfg_notified)
+)
 
 -- Overlay: off by default, eol ghost text after toggle.
 stackview.refresh(bufnr)
@@ -792,10 +1277,76 @@ vim.g.masm_stack = nil
 stackview.detach(bufnr)
 vim.cmd("edit!")
 
+-- Changedtick early-out: the debounced path must SKIP when nothing changed
+-- since the last publish (InsertLeave without an edit), and must still run
+-- after a real edit -- the early-out may never suppress a needed refresh.
+vim.g.masm_stack = { debounce_ms = 30 }
+stackview.attach(bufnr)
+vim.wait(200, function()
+  return false
+end, 20) -- drain attach's own scheduled first refresh
+stackview.refresh(bufnr)
+reset_memo_stats()
+vim.api.nvim_exec_autocmds("TextChanged", { buffer = bufnr }) -- no actual edit
+vim.wait(300, function()
+  return false
+end, 20) -- give the debounce timer time to fire (or correctly not refresh)
+check(
+  "view: no-edit debounce trigger skips analysis",
+  stack._memo_stats.hits + stack._memo_stats.misses == 0,
+  stack._memo_stats.hits .. "/" .. stack._memo_stats.misses
+)
+vim.api.nvim_buf_set_lines(bufnr, 0, 0, false, { "use miden::core::math::{rusty}" })
+vim.api.nvim_exec_autocmds("TextChanged", { buffer = bufnr })
+local re_ran = vim.wait(3000, function()
+  return stack._memo_stats.hits + stack._memo_stats.misses > 0
+end, 20)
+local drift_republished = false
+for _, d in ipairs(published()) do
+  if d.code == "unrecognized-import" then
+    drift_republished = true
+  end
+end
+check("view: real edit still refreshes through the early-out", re_ran and drift_republished)
+vim.g.masm_stack = nil
+stackview.detach(bufnr)
+vim.cmd("edit!")
+
+-- MAX_BUF_BYTES gate: an oversized buffer is refused BEFORE the analyzer
+-- runs (memo counters stay untouched), without an error and with nothing
+-- published. The buffer needs no name -- the size gate fires first.
+local big_buf = vim.api.nvim_create_buf(false, true)
+vim.api.nvim_buf_set_lines(big_buf, 0, -1, false, { string.rep("#", 2 * 1024 * 1024 + 1) })
+stackview.attach(big_buf)
+reset_memo_stats()
+local big_ok, big_err = pcall(stackview.refresh, big_buf)
+check("view: oversized buffer refresh does not error", big_ok, tostring(big_err))
+check(
+  "view: oversized buffer skips analysis entirely",
+  stack._memo_stats.hits + stack._memo_stats.misses == 0,
+  stack._memo_stats.hits .. "/" .. stack._memo_stats.misses
+)
+check(
+  "view: oversized buffer publishes nothing",
+  #vim.diagnostic.get(big_buf, { namespace = stackview._diag_ns }) == 0
+)
+stackview.detach(big_buf)
+vim.api.nvim_buf_delete(big_buf, { force = true })
+
+-- Empty (single-empty-line) buffer: the smallest buffer Neovim can hold
+-- must refresh without error and publish nothing.
+local empty_buf = vim.api.nvim_create_buf(false, true)
+vim.api.nvim_buf_set_name(empty_buf, here .. "/fixtures/app/empty_virtual.masm")
+stackview.attach(empty_buf)
+local empty_ok, empty_err = pcall(stackview.refresh, empty_buf)
+check("view: empty buffer refresh does not error", empty_ok, tostring(empty_err))
+check(
+  "view: empty buffer publishes nothing",
+  #vim.diagnostic.get(empty_buf, { namespace = stackview._diag_ns }) == 0
+)
+stackview.detach(empty_buf)
+vim.api.nvim_buf_delete(empty_buf, { force = true })
+
 ---------------------------------------------------------------------------
 
-if failed > 0 then
-  print(("stack tests: %d failure(s)"):format(failed))
-  os.exit(1)
-end
-print("stack tests: all passed")
+helpers.finish()

@@ -3,10 +3,11 @@
 -- query full of impossible patterns parses fine but matches nothing).
 -- Run with `make test-queries`, which builds the parser first.
 
-local script = debug.getinfo(1, "S").source:sub(2)
-local here = vim.fs.dirname(vim.fn.fnamemodify(script, ":p"))
-local plugin_root = vim.fs.dirname(here)
-vim.opt.rtp:prepend(plugin_root)
+local helpers = dofile(
+  vim.fs.dirname(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p")) .. "/helpers.lua"
+)
+local here = helpers.here
+local plugin_root = helpers.plugin_root
 vim.opt.rtp:prepend(here .. "/.parser-build") -- provides parser/masm.so
 
 local function read(path)
@@ -21,13 +22,12 @@ for _, f in ipairs({ "app/main.masm", "core_lib/math.masm", "std_lib/wrappers.ma
   sources[#sources + 1] = read(here .. "/fixtures/" .. f)
 end
 
-local failed = 0
 for _, qname in ipairs({ "highlights", "indents", "folds", "locals", "textobjects" }) do
   local src = read(plugin_root .. "/queries/masm/" .. qname .. ".scm")
   local ok, query = pcall(vim.treesitter.query.parse, "masm", src)
   if not ok then
     print("FAIL: " .. qname .. " does not parse: " .. tostring(query))
-    failed = failed + 1
+    helpers.failed = helpers.failed + 1
   else
     local captures = 0
     for _, text in ipairs(sources) do
@@ -39,7 +39,7 @@ for _, qname in ipairs({ "highlights", "indents", "folds", "locals", "textobject
     end
     if captures == 0 then
       print("FAIL: " .. qname .. " matched nothing on the fixtures")
-      failed = failed + 1
+      helpers.failed = helpers.failed + 1
     else
       print(string.format("PASS: %s (%d captures)", qname, captures))
     end
@@ -67,11 +67,8 @@ do
     print("PASS: locals has scope, definition and reference captures")
   else
     print("FAIL: locals lacks definition/reference captures: " .. vim.inspect(kinds))
-    failed = failed + 1
+    helpers.failed = helpers.failed + 1
   end
 end
 
-print(failed == 0 and "ALL PASS" or (failed .. " FAILURES"))
-if failed > 0 then
-  os.exit(1)
-end
+helpers.finish()

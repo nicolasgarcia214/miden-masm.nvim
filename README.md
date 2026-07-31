@@ -19,8 +19,10 @@ static stack analysis, with no language server required.
   `(b, a, ...) → (overflow, (a + b) mod 2^32, ...)`).
 - Find references (`grr`) into the quickfix list, resolving every candidate
   usage to its ground-truth definition, so renamed re-exports are unified
-  correctly. The scan runs time-sliced on the event loop, so even a huge
-  `extra_roots` never freezes the UI.
+  correctly. The scan runs time-sliced on the event loop -- the deadline is
+  checked between files, so even a huge `extra_roots` keeps the UI
+  responsive (a single enormous file is still scanned in one uninterrupted
+  slice).
 - Project-wide rename (`grn` / `:MasmRename`): renames the definition, every
   reference that spells the definition-site name, and the original side of
   `use { orig as alias }` items -- alias spellings correctly survive. Edits
@@ -72,6 +74,11 @@ indentation and folds need the tree-sitter parser.
 - [nvim-dap](https://github.com/mfussenegger/nvim-dap), plus `miden-debug`
   and/or `miden-client` builds supporting `--start-debug-adapter`, for the
   optional debugger
+
+Supported platforms: Linux and macOS, both covered by CI. Windows is
+untested and unsupported -- path handling throughout the plugin is POSIX
+(`/` separators, no drive letters), so expect navigation and indexing to
+break there rather than degrade gracefully.
 
 ## Installation
 
@@ -158,10 +165,14 @@ plugin registers a `miden` adapter and three default configurations (your
 own `dap.configurations.masm` wins if you define one): debug the current
 file with `miden-debug`, debug a transaction script with
 `miden-client exec`, or attach to a DAP server on `127.0.0.1:4711`. Launch
-configs accept the same keys as the Miden VS Code extension (`program`,
-`inputs`, `entrypoint`, `sysroot`, `searchPath`, `linkLibraries`,
-`sourcePathPrefixes`, `programArgs`, `scriptPath`, `accountId`, `host`,
-`port`, `cwd`), with `${file}`/`${workspaceFolder}` substitution. The
+configs accept the same keys as the Miden VS Code extension: `program`,
+`midenDebugPath`, `inputs`, `entrypoint`, `sysroot`, `searchPath`,
+`linkLibraries`, `sourcePathPrefixes`, `programArgs` (miden-debug);
+`scriptPath`, `midenClientPath`, `accountId` (miden-client); `runtime`
+(`"debugger"`/`"client"`, inferred from `program`/`scriptPath` when
+omitted); `host`, `port`, `cwd` (both) -- with
+`${file}`/`${workspaceFolder}` substitution. The `miden*Path` keys override
+which executable is spawned. The
 adapter waits for the backend's readiness line instead of probing the port
 -- the server accepts a single DAP connection and a probe would consume it.
 `:MasmDapState` shows the VM cycle, operand stack and call stack pushed via
@@ -188,14 +199,18 @@ The resolver mirrors the Miden assembler's project model:
   skipping `target/`, `node_modules/` and hidden directories, and is cached
   per session.
 
-On a large real-world project (the Miden protocol monorepo, ~180 files,
-~37k lines) a cold references scan takes ~250 ms and a warm one ~180 ms;
-go-to-definition is ~1 ms after the first jump.
+On a large real-world project (the Miden protocol monorepo, ~165 indexed
+files, ~33k lines) a cold references scan -- index build included -- takes
+~260 ms and a warm one ~200 ms; go-to-definition resolution is ~0.3 ms once
+the index is built, and stack analysis of the largest file (~2k lines) is
+~8 ms cold, ~2 ms warm. Measured with the bundled benchmark, which you can
+run against your own project:
+`nvim --headless --clean -l scripts/bench.lua <project-root>`.
 
 ## Configuration
 
-Optional, via `vim.g.masm_goto` (set it before the first jump, or run
-`:MasmRebuildIndex` after changing it):
+Optional, via `vim.g.masm_goto` (set it before the first `.masm` buffer is
+opened, or run `:MasmRebuildIndex` after changing it):
 
 ```lua
 vim.g.masm_goto = {
@@ -211,8 +226,9 @@ vim.g.masm_goto = {
 
 -- Set this to define your own keymaps instead of the default gd/grr/grn/gO/K
 -- (call require("masm.goto").references() / .rename() / .document_symbols()
--- and require("masm.hover").hover() directly; 'tagfunc' and 'omnifunc' stay
--- active either way, so <C-]>, :tag and <C-x><C-o> keep working).
+-- and require("masm.hover").hover() directly -- see :h miden-masm-api;
+-- 'tagfunc' and 'omnifunc' stay active either way, so <C-]>, :tag and
+-- <C-x><C-o> keep working).
 vim.g.masm_no_default_mappings = true
 
 -- Set this if you wire up vim.treesitter.start()/indentexpr/foldexpr
@@ -265,8 +281,11 @@ Honest list, so you know what you are getting:
   hop of a chain (including the middle) re-resolves on the next jump. A
   multi-line `use { .. } from` block longer than 40 lines is not recognized
   from inside its braces.
-- The first jump builds the project index synchronously (one bounded
-  directory walk). References and rename scans read every loaded buffer's
+- The project index is one bounded directory walk. It is built by the first
+  stack-analysis pass, scheduled a moment after the first `.masm` buffer
+  opens (stack analysis is on by default); with `vim.g.masm_no_stack` set,
+  it is built synchronously on the first jump instead. References and
+  rename scans read every loaded buffer's
   live text (falling back to disk); references run time-sliced in the
   background, while rename deliberately scans synchronously so its
   positions cannot race your edits.
@@ -295,7 +314,11 @@ Honest list, so you know what you are getting:
   handwritten `# => [...]` comment resynchronizes it (opt into seeing these
   with `bail_hints`). An `exec` whose consumption reaches the 16-element
   stack floor has an internals-dependent exact depth and is likewise
-  resynchronized from the next comment. Comments in `exec`-invoked
+  resynchronized from the next comment. That never-warn-on-unknowable rule
+  trades away one real warning: elements genuinely consumed from the
+  caller *before* a later instruction poisons the state go unreported as
+  caller-underflow unless a `# => [...]` resync clears the unknown state
+  before the procedure ends. Comments in `exec`-invoked
   procedures are checked for adoption but never flagged (they legitimately
   mix declared-inputs and caller views); wrong element *order* is caught
   only when both the comment and the simulation are fully named with

@@ -11,6 +11,17 @@
 -- to the freshly built table. Assigning once at startup would be silently
 -- discarded by that reload, and `:TSInstall masm` would report
 -- "unsupported language".
+-- Version guard first: on an older Neovim the plugin would load fine and
+-- then die much later with an obscure error deep in some API call. Failing
+-- loudly here names the actual problem once.
+if vim.fn.has("nvim-0.10.4") ~= 1 then
+  vim.notify_once(
+    "miden-masm.nvim requires Neovim >= 0.10.4; the plugin is disabled",
+    vim.log.levels.ERROR
+  )
+  return
+end
+
 if vim.g.loaded_miden_masm then
   return
 end

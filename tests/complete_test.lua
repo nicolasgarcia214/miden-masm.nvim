@@ -3,24 +3,14 @@
 --   nvim --headless --clean -l tests/complete_test.lua
 -- or `make test`.
 
-local script = debug.getinfo(1, "S").source:sub(2)
-local here = vim.fs.dirname(vim.fn.fnamemodify(script, ":p"))
-local plugin_root = vim.fs.dirname(here)
-vim.opt.rtp:prepend(plugin_root)
+local helpers = dofile(
+  vim.fs.dirname(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p")) .. "/helpers.lua"
+)
+local here = helpers.here
+local check = helpers.check
 
 local complete = require("masm.complete")
 local root = here .. "/fixtures/"
-
-local failed = 0
-
-local function check(desc, ok, detail)
-  if ok then
-    print("PASS: " .. desc)
-  else
-    print("FAIL: " .. desc .. (detail and (" -- " .. detail) or ""))
-    failed = failed + 1
-  end
-end
 
 -- Appends `line_text` to the fixture buffer, puts the cursor at its end (as
 -- insert-mode completion would) and runs the omnifunc protocol: findstart,
@@ -112,8 +102,7 @@ check(
 check("push.math::: procs excluded", items["add_checked"] == nil)
 
 -- Bare instruction position: opcodes with stack effects, filtered by base.
-local list
-list, _ = complete_at("    ad")
+local list = complete_at("    ad")
 items = words(list)
 check("opcode: add offered with stack effect", items["add"] ~= nil and items["add"].menu ~= nil)
 check("opcode: description in info", items["add"] ~= nil and items["add"].info ~= nil)
@@ -155,7 +144,23 @@ local _, base, start = complete_at("    exec.local")
 check("findstart: base is the trailing word", base == "local", base)
 check("findstart: start at base start", start == #"    exec.", tostring(start))
 
-print(failed == 0 and "ALL PASS" or (failed .. " FAILURES"))
-if failed > 0 then
-  os.exit(1)
-end
+-- `$`-sigil names complete like any other identifier (util.IDENT charset):
+-- a buffer-local `$`-named const must survive findstart AND the const scan.
+vim.cmd("edit! " .. root .. "app/main.masm")
+vim.wo.virtualedit = "onemore"
+vim.api.nvim_buf_set_lines(0, 0, 0, false, { "const $FLAG=7" })
+local dollar_line = "    push.$"
+vim.api.nvim_buf_set_lines(0, -1, -1, false, { dollar_line })
+vim.api.nvim_win_set_cursor(0, { vim.api.nvim_buf_line_count(0), #dollar_line })
+local dstart = complete.omnifunc(1, "")
+local dbase = dollar_line:sub(dstart + 1)
+local ditems = words(complete.omnifunc(0, dbase))
+vim.cmd("edit!")
+check("dollar: findstart keeps the sigil in the base", dbase == "$", vim.inspect(dbase))
+check(
+  "dollar: $-named const offered after push.",
+  ditems["$FLAG"] ~= nil and ditems["$FLAG"].kind == "v",
+  vim.inspect(vim.tbl_keys(ditems))
+)
+
+helpers.finish()

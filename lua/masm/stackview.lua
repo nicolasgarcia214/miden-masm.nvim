@@ -12,10 +12,16 @@
 --    no handwritten `# =>` comment exists -- well-annotated files stay
 --    visually unchanged; overlay value concentrates on unannotated code.
 --  * All work is synchronous on the UI thread and therefore bounded: a
---    buffer-size gate here, instruction/lookup budgets in the engine, and a
---    debounce so TextChanged storms collapse into one analysis.
+--    buffer-size gate here, instruction/lookup budgets in the engine, a
+--    debounce so TextChanged storms collapse into one analysis, and a
+--    changedtick early-out so debounced no-op triggers (InsertLeave without
+--    an edit) skip the pass entirely.
 --  * Only `eol` virt_text is used -- `eol_right_align` is 0.11+ and the
 --    supported floor is 0.10.4.
+
+local notation = require("masm.stacknotation")
+local stack = require("masm.stack")
+local util = require("masm.util")
 
 local M = {}
 
@@ -43,9 +49,25 @@ vim.api.nvim_create_autocmd("ColorScheme", {
 -- MAX_FILE_BYTES: no real .masm file approaches it).
 local MAX_BUF_BYTES = 2 * 1024 * 1024
 
--- Per-buffer state: { timer, tick, overlay (bool), notified (bool) }.
+-- Per-buffer state:
+-- { timer, overlay (bool), notified (bool), analyzed_tick (changedtick at
+--   the last successful publish; the debounced path's early-out key) }.
+---@class masm.StackViewState
+---@field timer uv.uv_timer_t? debounce timer (nil only after detach)
+---@field overlay boolean ghost-text overlay currently enabled
+---@field notified boolean? a too-large/failed notice was already shown
+---@field analyzed_tick integer? changedtick at the last successful publish
+
+---@type table<integer, masm.StackViewState>
 local buffers = {}
 
+---@class masm.StackViewConfig the resolved per-refresh configuration
+---@field diagnostics boolean publish stack diagnostics at all
+---@field overlay boolean start attached buffers with the overlay on
+---@field overlay_mode '"auto"'|'"all"' ghost text only where unannotated, or everywhere
+---@field check_comments boolean publish comment-stale/comment-reordered warnings
+---@field bail_hints boolean publish hint-severity diagnostics too
+---@field debounce_ms number edit-to-refresh debounce
 local defaults = {
   diagnostics = true,
   overlay = false,
@@ -55,16 +77,63 @@ local defaults = {
   debounce_ms = 300,
 }
 
+-- Per-field validity checks and the expectation named in the warning.
+-- Manual checks rather than vim.validate: its table-form signature is
+-- deprecated upstream and the replacement form does not exist on the
+-- 0.10.4 floor, so neither spelling works everywhere we run.
+local function is_bool(v)
+  return type(v) == "boolean"
+end
+local FIELD_SPECS = {
+  diagnostics = { ok = is_bool, want = "a boolean" },
+  overlay = { ok = is_bool, want = "a boolean" },
+  check_comments = { ok = is_bool, want = "a boolean" },
+  bail_hints = { ok = is_bool, want = "a boolean" },
+  overlay_mode = {
+    ok = function(v)
+      return v == "auto" or v == "all"
+    end,
+    want = '"auto" or "all"',
+  },
+  debounce_ms = {
+    ok = function(v)
+      return type(v) == "number" and v >= 0
+    end,
+    want = "a non-negative number",
+  },
+}
+
 -- Read lazily on every refresh, like vim.g.masm_goto: no setup() call.
+-- Invalid fields fall back to their defaults with a one-time actionable
+-- notification: a mistyped value must degrade loudly, not quietly --
+-- `overlay_mode = true` used to silently disable the "auto" gating, and
+-- `debounce_ms = "300"` only worked through luv's implicit coercion.
+---@return masm.StackViewConfig
 local function get_config()
   local user = vim.g.masm_stack
-  if type(user) ~= "table" then
-    user = {}
+  if user ~= nil and type(user) ~= "table" then
+    vim.notify_once(
+      ("masm stack: vim.g.masm_stack must be a table, got %s; using defaults"):format(type(user)),
+      vim.log.levels.WARN
+    )
+    user = nil
   end
+  user = user or {}
   local cfg = {}
   for k, v in pairs(defaults) do
     local uv = user[k]
-    if uv == nil then
+    if uv == nil or not FIELD_SPECS[k].ok(uv) then
+      if uv ~= nil then
+        vim.notify_once(
+          ("masm stack: vim.g.masm_stack.%s must be %s, got %s; using the default (%s)"):format(
+            k,
+            FIELD_SPECS[k].want,
+            vim.inspect(uv),
+            vim.inspect(v)
+          ),
+          vim.log.levels.WARN
+        )
+      end
       cfg[k] = v
     else
       cfg[k] = uv
@@ -79,6 +148,10 @@ local SEVERITIES = {
   hint = vim.diagnostic.severity.HINT,
 }
 
+---@param bufnr integer
+---@param result masm.StackResult
+---@param cfg masm.StackViewConfig
+---@param drift {lnum: integer}[]? unrecognized-import lines (masm.goto)
 local function publish(bufnr, result, cfg, drift)
   local items = {}
   if cfg.diagnostics then
@@ -116,8 +189,9 @@ end
 
 -- True when the raw line already carries a handwritten operand-stack
 -- tracker (`# => [...]` / `# OS => [...]`).
+---@param line string
+---@return boolean
 local function has_tracker(line)
-  local notation = require("masm.stacknotation")
   local comment = notation.comment_part(line)
   if not comment then
     return false
@@ -125,10 +199,13 @@ local function has_tracker(line)
   return notation.tracker_kind(comment) == "tracker"
 end
 
-local function render_overlay(bufnr, result, cfg)
+-- `lines` is the refresh's single buffer read, passed through.
+---@param bufnr integer
+---@param result masm.StackResult
+---@param cfg masm.StackViewConfig
+---@param lines string[]
+local function render_overlay(bufnr, result, cfg, lines)
   vim.api.nvim_buf_clear_namespace(bufnr, mark_ns, 0, -1)
-  local stack = require("masm.stack")
-  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
   -- Lines the engine flagged as stale keep their ghost text even in "auto"
   -- mode: the corrected state IS the payload there.
   local stale = {}
@@ -174,8 +251,11 @@ local function render_overlay(bufnr, result, cfg)
 end
 
 -- The synchronous pipeline; also the test hook (no timers involved).
+-- nil/0 normalize to the current buffer, exactly like attach/toggle/detach
+-- (refresh(nil) used to silently no-op while the siblings accepted it).
+---@param bufnr integer? nil/0 = current buffer
 function M.refresh(bufnr)
-  bufnr = bufnr == 0 and vim.api.nvim_get_current_buf() or bufnr
+  bufnr = util.norm_bufnr(bufnr)
   local state = buffers[bufnr]
   if not state then
     return
@@ -191,13 +271,23 @@ function M.refresh(bufnr)
     end
     return
   end
-  local stack = require("masm.stack")
+  -- One buffer read serves the whole refresh: the analysis, the drift
+  -- canary and the overlay's tracker checks all consume the same lines
+  -- (going through stack.analyze re-read the buffer, and the canary
+  -- concatenated a second copy of it).
+  local path = vim.api.nvim_buf_get_name(bufnr)
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
   -- Last-resort containment: this runs from TextChanged/InsertLeave
   -- autocmds, and one uncaught nil deep in the simulator would otherwise
   -- become a repeating error notification on every edit. The engine's own
   -- contract is to return reasons, so tripping this is a bug -- but a
   -- contained one.
-  local an_ok, result, reason = pcall(stack.analyze, bufnr)
+  local an_ok, result, reason
+  if path == "" then
+    an_ok, result, reason = true, nil, "unnamed buffer"
+  else
+    an_ok, result, reason = pcall(stack.analyze_lines, lines, path)
+  end
   if not an_ok then
     result, reason = nil, "internal analyzer error: " .. tostring(result)
   end
@@ -211,16 +301,20 @@ function M.refresh(bufnr)
     end
     return
   end
-  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
   local drift = require("masm.goto").unrecognized_imports(table.concat(lines, "\n"))
   publish(bufnr, result, cfg, drift)
   if state.overlay then
-    render_overlay(bufnr, result, cfg)
+    render_overlay(bufnr, result, cfg, lines)
   else
     vim.api.nvim_buf_clear_namespace(bufnr, mark_ns, 0, -1)
   end
+  -- Records what was published so the debounced path can skip a no-op
+  -- re-analysis (InsertLeave without an edit). Only set after a successful
+  -- publish: failed attempts stay retryable.
+  state.analyzed_tick = vim.api.nvim_buf_get_changedtick(bufnr)
 end
 
+---@param bufnr integer
 local function schedule_refresh(bufnr)
   local state = buffers[bufnr]
   if not state or not state.timer then
@@ -232,13 +326,30 @@ local function schedule_refresh(bufnr)
     cfg.debounce_ms,
     0,
     vim.schedule_wrap(function()
+      -- Changedtick early-out, debounced path ONLY: InsertLeave fires on
+      -- every insert-mode exit whether or not an edit happened, and a
+      -- no-edit exit would otherwise re-run the full analysis for an
+      -- identical publish. Direct refresh() calls (BufWritePost, toggle,
+      -- tests) always run: writes change file mtimes the contract caches
+      -- key on, and toggling must re-render regardless of edits.
+      local st = buffers[bufnr]
+      if
+        st
+        and st.analyzed_tick
+        and vim.api.nvim_buf_is_loaded(bufnr)
+        and vim.api.nvim_buf_get_changedtick(bufnr) == st.analyzed_tick
+      then
+        return
+      end
       M.refresh(bufnr)
     end)
   )
 end
 
+-- Toggles the ghost-text overlay for the buffer (:MasmStackToggle).
+---@param bufnr integer? nil/0 = current buffer
 function M.toggle(bufnr)
-  bufnr = (bufnr == nil or bufnr == 0) and vim.api.nvim_get_current_buf() or bufnr
+  bufnr = util.norm_bufnr(bufnr)
   local state = buffers[bufnr]
   if not state then
     return
@@ -247,14 +358,19 @@ function M.toggle(bufnr)
   M.refresh(bufnr)
 end
 
+-- Wires the analyzer to the buffer: debounced refresh on edits, immediate
+-- refresh on write, teardown on unload. Idempotent per buffer.
+---@param bufnr integer? nil/0 = current buffer
 function M.attach(bufnr)
-  bufnr = (bufnr == nil or bufnr == 0) and vim.api.nvim_get_current_buf() or bufnr
+  bufnr = util.norm_bufnr(bufnr)
   if buffers[bufnr] then
     return
   end
   local cfg = get_config()
   buffers[bufnr] = {
-    timer = vim.uv.new_timer(),
+    -- util.uv, not bare vim.uv: the supported floor predates the rename
+    -- being universal, and every other module already aliases it.
+    timer = util.uv.new_timer(),
     overlay = cfg.overlay and true or false,
   }
   local group = vim.api.nvim_create_augroup("masm_stack_" .. bufnr, { clear = true })
@@ -289,8 +405,9 @@ function M.attach(bufnr)
 end
 
 -- Idempotent: teardown may run twice (undo_ftplugin + BufUnload).
+---@param bufnr integer? nil/0 = current buffer
 function M.detach(bufnr)
-  bufnr = (bufnr == nil or bufnr == 0) and vim.api.nvim_get_current_buf() or bufnr
+  bufnr = util.norm_bufnr(bufnr)
   local state = buffers[bufnr]
   if not state then
     return

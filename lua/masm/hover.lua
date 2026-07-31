@@ -44,12 +44,16 @@ end
 -- Reads the resolved file's lines, preferring live buffer text whenever ANY
 -- loaded buffer holds the file -- not just the current one: a definition
 -- edited in another window must hover its unsaved docs, not the disk state.
+-- util.loaded_bufnr is the exact-name lookup scans use, and util.read_file
+-- honors the same untrusted-input rules as the index (bounded reads, regular
+-- files only).
 local function file_lines(path)
-  local bufnr = require("masm.goto")._loaded_bufnr(path)
+  local util = require("masm.util")
+  local bufnr = util.loaded_bufnr(path)
   if bufnr then
     return vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
   end
-  local text = require("masm.goto")._read_file(path)
+  local text = util.read_file(path)
   return text and vim.split(text, "\n")
 end
 
@@ -131,6 +135,8 @@ end
 
 -- Returns { lines, masm } (masm: highlight the float as MASM source), or nil
 -- and a reason.
+---@return {lines: string[], masm: boolean}? content
+---@return string? reason
 function M.content()
   local item, reason = require("masm.goto").resolve()
   if item then
@@ -242,6 +248,7 @@ end
 
 -- Shows the hover float; a second `K` focuses it (then the usual window
 -- commands apply, plus `q` to close).
+---@return nil
 function M.hover()
   if state.win and vim.api.nvim_win_is_valid(state.win) then
     state.focusing = true

@@ -3,15 +3,38 @@
 --   nvim --headless --clean -l tests/masm_test.lua
 -- or `make test`.
 
-local script = debug.getinfo(1, "S").source:sub(2)
-local here = vim.fs.dirname(vim.fn.fnamemodify(script, ":p"))
-local plugin_root = vim.fs.dirname(here)
-vim.opt.rtp:prepend(plugin_root)
+local helpers = dofile(
+  vim.fs.dirname(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p")) .. "/helpers.lua"
+)
+local here = helpers.here
+local check = helpers.check
 
 local goto_mod = require("masm.goto")
-local root = here .. "/fixtures/"
+local uv = vim.uv or vim.loop
 
-local failed = 0
+-- The whole suite runs against a TEMP COPY of tests/fixtures/, never the
+-- tracked tree: several blocks below mutate fixtures on disk (stale-cache
+-- padding, chain retargeting, created-then-removed files) and restore them
+-- afterwards -- but a hard crash (kill -9, OOM) would defeat any in-process
+-- restore and leave the checkout dirty. Copying once up front removes that
+-- hazard for every block at once; the copy is deleted in teardown, and a
+-- crash can at worst leak a temp directory. Expectations only ever match on
+-- fixture-relative suffixes, so the relocated root is invisible to them.
+local function copy_tree(src, dst)
+  vim.fn.mkdir(dst, "p")
+  for name, kind in vim.fs.dir(src) do
+    local s, d = src .. "/" .. name, dst .. "/" .. name
+    if kind == "directory" then
+      copy_tree(s, d)
+    else
+      assert(uv.fs_copyfile(s, d), "fixture copy failed: " .. s)
+    end
+  end
+end
+
+local tmp_root = vim.fn.tempname()
+copy_tree(here .. "/fixtures", tmp_root .. "/fixtures")
+local root = tmp_root .. "/fixtures/"
 
 -- ------------------------------------------------------------------------
 -- Go-to-definition: place the cursor on `find` (+ `off` bytes) and check the
@@ -185,23 +208,23 @@ for _, c in ipairs(cases) do
   end
   if not lnum then
     print("FAIL (locator): " .. c.desc)
-    failed = failed + 1
+    helpers.failed = helpers.failed + 1
   else
     vim.api.nvim_win_set_cursor(0, { lnum, col })
     local ok, res = pcall(goto_mod.tagfunc, "", "c", {})
     if not ok then
       print("FAIL (error): " .. c.desc .. ": " .. tostring(res))
-      failed = failed + 1
+      helpers.failed = helpers.failed + 1
     elseif c.expect_fail then
       if res == vim.NIL or #res == 0 then
         print("PASS: " .. c.desc)
       else
         print("FAIL (should not resolve): " .. c.desc .. " -> " .. res[1].filename)
-        failed = failed + 1
+        helpers.failed = helpers.failed + 1
       end
     elseif res == vim.NIL or #res == 0 then
       print("FAIL (no result): " .. c.desc)
-      failed = failed + 1
+      helpers.failed = helpers.failed + 1
     else
       local item = res[1]
       local fileok = not c.expect_file or item.filename:sub(-#c.expect_file) == c.expect_file
@@ -220,7 +243,7 @@ for _, c in ipairs(cases) do
         print("PASS: " .. c.desc)
       else
         print("FAIL: " .. c.desc .. " -> " .. item.filename .. ":" .. item.cmd)
-        failed = failed + 1
+        helpers.failed = helpers.failed + 1
       end
     end
   end
@@ -229,15 +252,6 @@ end
 -- ------------------------------------------------------------------------
 -- References and document symbols
 -- ------------------------------------------------------------------------
-
-local function check(desc, ok, detail)
-  if ok then
-    print("PASS: " .. desc)
-  else
-    print("FAIL: " .. desc .. (detail and (" -- " .. detail) or ""))
-    failed = failed + 1
-  end
-end
 
 -- references()/document_symbols() focus the quickfix/location window; close
 -- it so the next case operates on the source buffer again.
@@ -257,18 +271,7 @@ local function has_ref(items, file_suffix, text_frag)
   return false
 end
 
-local function place(file, find, off)
-  vim.cmd("edit! " .. root .. file)
-  local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
-  for i, l in ipairs(lines) do
-    local s = l:find(find, 1, true)
-    if s then
-      vim.api.nvim_win_set_cursor(0, { i, s - 1 + (off or 0) })
-      return true
-    end
-  end
-  return false
-end
+local place = helpers.placer(root)
 
 -- Const references, including through renames in both directions.
 place("app/main.masm", "push.MAX_VALUE", 5)
@@ -370,9 +373,10 @@ check(
 )
 
 -- Stale-cache regression: after an on-disk edit shifts a definition, the
--- next jump must land on the new line, without :MasmRebuildIndex. The tracked
--- fixture is mutated on disk, so EVERYTHING between the write and the restore
--- runs under pcall: an error mid-test must never leave the fixture padded.
+-- next jump must land on the new line, without :MasmRebuildIndex. The fixture
+-- copy is mutated on disk, so EVERYTHING between the write and the restore
+-- runs under pcall: an error mid-test must never leave the copy padded for
+-- the blocks below (the tracked tree is out of reach either way).
 local math_path = root .. "core_lib/math.masm"
 local fh = assert(io.open(math_path, "r"))
 local orig_math = fh:read("*a")
@@ -396,6 +400,124 @@ check(
     .. " -> "
     .. (run_ok and after[1] and after[1].cmd or tostring(after))
 )
+
+-- ------------------------------------------------------------------------
+-- Buffer-vs-disk freshness matrix: {clean, modified} x {disk unchanged,
+-- disk changed} on the resolve path. Pins file_interface's contract
+-- directly -- a MODIFIED loaded buffer wins over disk (changedtick key), a
+-- clean or absent buffer tracks disk (stat key) -- so the fast-path
+-- revalidation (remembered bufnr, bufexists for "none") cannot drift from
+-- the full-walk semantics without a test going red. Each cell lands the
+-- jump at a distinct line offset, so a wrong source is visible as a wrong
+-- line, never as a vacuous pass. Disk is mutated, so the whole block runs
+-- under pcall with an unconditional restore after it.
+-- ------------------------------------------------------------------------
+
+-- Prepends `n` `# pad` lines to the math buffer's CURRENT content.
+local function pad_buffer(bufnr, n)
+  local pads = {}
+  for _ = 1, n do
+    pads[#pads + 1] = "# pad"
+  end
+  vim.api.nvim_buf_set_lines(bufnr, 0, 0, false, pads)
+end
+
+local function write_math(text)
+  local w = assert(io.open(math_path, "w"))
+  w:write(text)
+  w:close()
+end
+
+-- The jump target's line number, as a number (nil when unresolved).
+local function jump_lnum()
+  place("app/main.masm", "push.MAX_VALUE", 5)
+  local res = goto_mod.tagfunc("", "c", {})
+  return res ~= vim.NIL and res[1] and tonumber(res[1].cmd) or nil
+end
+
+vim.cmd("edit! " .. root .. "core_lib/math.masm") -- loaded and clean
+local math_buf = vim.fn.bufnr()
+local base_lnum = jump_lnum()
+local matrix_ok, matrix_err = pcall(function()
+  -- Clean buffer + disk unchanged: the cache hit serves the same line.
+  check("buffer/disk matrix: clean + disk unchanged (cache hit)", jump_lnum() == base_lnum)
+
+  -- Clean buffer + disk changed: the clean buffer's content is stale by
+  -- definition of "clean" (it matches what was READ, not what IS); disk is
+  -- the truth and the stat key must notice the write.
+  write_math("# pad\n# pad\n" .. orig_math)
+  check(
+    "buffer/disk matrix: clean + disk changed tracks disk",
+    jump_lnum() == base_lnum + 2,
+    "got " .. tostring(jump_lnum())
+  )
+
+  -- Modified buffer + disk unchanged: unsaved edits win over the file.
+  write_math(orig_math)
+  pad_buffer(math_buf, 5)
+  check(
+    "buffer/disk matrix: modified + disk unchanged, buffer wins",
+    jump_lnum() == base_lnum + 5,
+    "got " .. tostring(jump_lnum())
+  )
+
+  -- Modified buffer + disk changed: the buffer STILL wins -- a concurrent
+  -- on-disk change must not clobber unsaved edits mid-review.
+  write_math("# pad\n# pad\n" .. orig_math)
+  check(
+    "buffer/disk matrix: modified + disk changed, buffer still wins",
+    jump_lnum() == base_lnum + 5,
+    "got " .. tostring(jump_lnum())
+  )
+
+  -- A further buffer edit moves the changedtick: the b:<bufnr>:<tick> key
+  -- must re-parse (a stale hit would keep serving the +5 line).
+  pad_buffer(math_buf, 2)
+  check(
+    "buffer/disk matrix: second buffer edit re-parses via changedtick",
+    jump_lnum() == base_lnum + 7,
+    "got " .. tostring(jump_lnum())
+  )
+
+  -- Reverted (:edit!): the buffer is clean again and reloaded from disk,
+  -- so resolution falls back to the disk state (still padded by 2 here).
+  vim.api.nvim_buf_call(math_buf, function()
+    vim.cmd("edit!")
+  end)
+  check(
+    "buffer/disk matrix: reverted buffer falls back to disk",
+    jump_lnum() == base_lnum + 2,
+    "got " .. tostring(jump_lnum())
+  )
+  write_math(orig_math)
+  check("buffer/disk matrix: disk restore lands on the original line", jump_lnum() == base_lnum)
+
+  -- No buffer at all, then a buffer APPEARS and is modified: the cached
+  -- "no buffer" answer (revalidated via bufexists) must notice the new
+  -- buffer's unsaved edits, not keep serving disk.
+  vim.cmd("bwipeout! " .. math_buf)
+  check("buffer/disk matrix: no buffer reads disk", jump_lnum() == base_lnum)
+  local reopened = vim.fn.bufadd(math_path)
+  vim.fn.bufload(reopened)
+  pad_buffer(reopened, 3)
+  check(
+    "buffer/disk matrix: buffer appearing modified wins over disk",
+    jump_lnum() == base_lnum + 3,
+    "got " .. tostring(jump_lnum())
+  )
+end)
+-- Unconditional restore: disk back to the original, any modified math
+-- buffer reverted, so later blocks (and the tracked expectations) see the
+-- pristine fixture whatever happened above.
+write_math(orig_math)
+for _, b in ipairs(vim.api.nvim_list_bufs()) do
+  if vim.api.nvim_buf_is_loaded(b) and vim.api.nvim_buf_get_name(b) == math_path then
+    vim.api.nvim_buf_call(b, function()
+      vim.cmd("edit!")
+    end)
+  end
+end
+check("buffer/disk matrix: block completed", matrix_ok, tostring(matrix_err))
 
 -- Document symbols.
 vim.cmd("edit! " .. root .. "core_lib/math.masm")
@@ -501,7 +623,29 @@ check("rename: nothing written to disk", disk_math:find("MAX_VALUE", 1, true) ~=
 
 -- Renamed-state navigation still works (buffers are the source of truth),
 -- then discard every unsaved buffer so later suites see the fixtures.
-place("app/main.masm", "push.RENAMED_MAX", 5)
+-- The cursor is placed WITHOUT place(): its `edit!` reloads from disk,
+-- which would discard the unsaved rename this assertion is about (and
+-- did -- the pre-helpers place() returned false silently here, leaving
+-- the cursor on the pre-rename spot and the check passing vacuously).
+do
+  local target = root .. "app/main.masm"
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(b) and vim.api.nvim_buf_get_name(b) == target then
+      vim.api.nvim_set_current_buf(b)
+      break
+    end
+  end
+  local placed = false
+  for i, l in ipairs(vim.api.nvim_buf_get_lines(0, 0, -1, false)) do
+    local s = l:find("push.RENAMED_MAX", 1, true)
+    if s then
+      vim.api.nvim_win_set_cursor(0, { i, s - 1 + 5 })
+      placed = true
+      break
+    end
+  end
+  check("rename: renamed usage present in the live buffer", placed)
+end
 local renamed_jump = goto_mod.tagfunc("", "c", {})
 check(
   "rename: navigation follows the new name",
@@ -588,6 +732,8 @@ check(
 -- submitting (what an async dressing/snacks prompt amounts to), the symbol
 -- captured at prompt time is renamed -- not whatever the cursor lands on.
 local saved_input = vim.ui.input
+-- Replacing the typed built-in is the point of the stub; restored below.
+---@diagnostic disable-next-line: duplicate-set-field
 vim.ui.input = function(_, cb)
   place("app/main.masm", "push.MAX_VALUE", 5)
   cb("PROMPTED_LIMIT")
@@ -611,8 +757,9 @@ restore_modified_buffers()
 -- wrappers::LIMIT resolves main.masm -> wrappers.masm (pub use) ->
 -- math.masm MAX_VALUE. Retargeting the middle hop on disk must serve the
 -- new destination on the very next jump, without :MasmRebuildIndex. The
--- tracked fixture is mutated on disk, so everything between the write and
--- the restore runs under pcall.
+-- fixture copy is mutated on disk, so everything between the write and
+-- the restore runs under pcall (for the blocks below; the tracked tree is
+-- out of reach either way).
 local wr_path = root .. "std_lib/wrappers.masm"
 local wfh = assert(io.open(wr_path, "r"))
 local orig_wr = wfh:read("*a")
@@ -738,6 +885,107 @@ vim.fn.delete(ext_root, "rf")
 check("config surface: block completed", config_ok, tostring(config_err))
 
 -- ------------------------------------------------------------------------
+-- Configuration surface: invalid values degrade loudly to the defaults
+-- ------------------------------------------------------------------------
+
+local bad_cfg_ok, bad_cfg_err = pcall(function()
+  local notified = {}
+  local saved_notify = vim.notify
+  -- Replacing the typed built-in is the point of the stub; restored below.
+  ---@diagnostic disable-next-line: duplicate-set-field
+  vim.notify = function(msg)
+    notified[#notified + 1] = tostring(msg)
+  end
+  -- extra_roots is not string-or-list, ignore_dirs has a non-string entry:
+  -- both must be refused with a named notification, and resolution must
+  -- keep working on the defaults instead of silently degrading.
+  vim.g.masm_goto = { extra_roots = 42, ignore_dirs = { "target", 7 } }
+  goto_mod.clear_cache()
+  vim.cmd("edit! " .. root .. "app/main.masm")
+  local hit = goto_mod.tagfunc("math::add_checked", "", {})
+  vim.notify = saved_notify
+  check(
+    "config validation: invalid fields fall back to working defaults",
+    hit ~= vim.NIL and hit[1] ~= nil and hit[1].filename:find("math.masm", 1, true) ~= nil,
+    vim.inspect(hit)
+  )
+  local mentions = { extra_roots = false, ignore_dirs = false }
+  for _, msg in ipairs(notified) do
+    for field in pairs(mentions) do
+      if msg:find("masm_goto." .. field, 1, true) then
+        mentions[field] = true
+      end
+    end
+  end
+  check(
+    "config validation: each invalid field notifies by name",
+    mentions.extra_roots and mentions.ignore_dirs,
+    vim.inspect(notified)
+  )
+end)
+vim.g.masm_goto = nil
+goto_mod.clear_cache()
+check("config validation: block completed", bad_cfg_ok, tostring(bad_cfg_err))
+
+-- ------------------------------------------------------------------------
+-- `$`-sigil identifiers: selective import, navigation and rename all use
+-- the one util.IDENT charset (temp fixtures, removed afterwards)
+-- ------------------------------------------------------------------------
+
+local dollar_def = root .. "core_lib/dollar.masm"
+local dollar_user = root .. "app/dollar_user.masm"
+local dollar_ok, dollar_err = pcall(function()
+  local w = assert(io.open(dollar_def, "w"))
+  w:write("pub proc $special\n    push.1 drop\nend\n")
+  w:close()
+  w = assert(io.open(dollar_user, "w"))
+  w:write("use {$special} from fix::core::dollar\n\nproc caller\n    exec.$special\nend\n")
+  w:close()
+  goto_mod.clear_cache()
+
+  -- gd through the selective import.
+  place("app/dollar_user.masm", "exec.$special", 6)
+  local hit = goto_mod.tagfunc("", "c", {})
+  check(
+    "dollar: selective import resolves to the definition",
+    hit ~= vim.NIL
+      and hit[1] ~= nil
+      and hit[1].filename:find("core_lib/dollar.masm", 1, true) ~= nil,
+    vim.inspect(hit)
+  )
+
+  -- References reach both sides of the import.
+  place("app/dollar_user.masm", "exec.$special", 6)
+  local drefs = goto_mod.references({ sync = true }) or {}
+  close_lists()
+  check("dollar: definition file referenced", has_ref(drefs, "core_lib/dollar.masm", nil))
+  check("dollar: importing file referenced", has_ref(drefs, "app/dollar_user.masm", nil))
+
+  -- Rename round-trips the sigil: definition, `use { .. }` item and call
+  -- site all rewrite, onto a name that keeps the `$`.
+  place("app/dollar_user.masm", "exec.$special", 6)
+  local dres, dwhy = goto_mod.rename("$renamed")
+  check("dollar: rename succeeds", dres ~= nil, tostring(dwhy))
+  local dtext = buffer_text_of("core_lib/dollar.masm")
+  check("dollar: definition renamed", dtext:find("pub proc $renamed", 1, true) ~= nil)
+  local utext = buffer_text_of("app/dollar_user.masm")
+  check("dollar: import item renamed", utext:find("{$renamed}", 1, true) ~= nil)
+  check("dollar: call site renamed", utext:find("exec.$renamed", 1, true) ~= nil)
+end)
+-- Discard the unsaved rename edits, then the temp fixtures themselves.
+for _, b in ipairs(vim.api.nvim_list_bufs()) do
+  if vim.api.nvim_buf_is_loaded(b) and vim.bo[b].modified then
+    vim.api.nvim_buf_call(b, function()
+      vim.cmd("edit!")
+    end)
+  end
+end
+os.remove(dollar_def)
+os.remove(dollar_user)
+goto_mod.clear_cache()
+check("dollar: block completed", dollar_ok, tostring(dollar_err))
+
+-- ------------------------------------------------------------------------
 -- Resolver limits: re-export depth cap and cycle detection
 -- ------------------------------------------------------------------------
 
@@ -792,9 +1040,9 @@ check("resolver limits: block completed", limits_ok, tostring(limits_err))
 -- ------------------------------------------------------------------------
 
 local function read_fixture(rel)
-  local fh = assert(io.open(root .. rel, "r"))
-  local text = fh:read("*a")
-  fh:close()
+  local f = assert(io.open(root .. rel, "r"))
+  local text = f:read("*a")
+  f:close()
   return text
 end
 
@@ -834,7 +1082,8 @@ check(
 )
 check("drift canary: dotted path flagged", #drift == 2 and drift[2].lnum == 11, vim.inspect(drift))
 
-print(failed == 0 and "ALL PASS" or (failed .. " FAILURES"))
-if failed > 0 then
-  os.exit(1)
-end
+-- Teardown: drop the fixture copy, whatever happened above (a crash before
+-- this line merely leaks a temp directory -- the tracked tree stays clean).
+vim.fn.delete(tmp_root, "rf")
+
+helpers.finish()

@@ -19,7 +19,9 @@
 
 local M = {}
 
-local uv = vim.uv or vim.loop
+-- util.uv, not a fresh `vim.uv or vim.loop`: the alias is derived once in
+-- masm.util so every module agrees (see stackview for the same rule).
+local uv = require("masm.util").uv
 
 local READY_PATTERN = "DAP server listening"
 local READY_TIMEOUT_MS = 15000
@@ -28,8 +30,16 @@ local READY_TIMEOUT_MS = 15000
 -- Launch plumbing (UI-free, exercised directly by tests)
 ---------------------------------------------------------------------------
 
--- Maps a launch configuration to the backend argv. Returns
--- { cmd, args, cwd } or nil and a reason. `addr` is "host:port".
+---@class masm.DapLaunchSpec what to spawn for a launch request
+---@field cmd string backend executable (miden-debug / miden-client)
+---@field args string[] argv, `--start-debug-adapter <addr>` included
+---@field cwd string working directory the backend runs in
+
+-- Maps a launch configuration to the backend argv. `addr` is "host:port".
+---@param config table the nvim-dap launch configuration
+---@param addr string
+---@return masm.DapLaunchSpec? spec
+---@return string? reason
 function M._build_launch(config, addr)
   local cwd = config.cwd or vim.fn.getcwd()
   local runtime = config.runtime
@@ -89,9 +99,17 @@ end
 -- kernel-assigned free port. The listener closes before the backend starts,
 -- which is a small race by design -- the same one every "find a free port"
 -- launcher accepts.
+---@param host string
+---@param preferred integer
+---@return integer? port nil when nothing can be bound on `host`
 function M._free_port(host, preferred)
   local function try(port)
+    -- new_tcp can fail (fd exhaustion); a launch attempt in that state
+    -- should report "no port", not crash on a nil handle.
     local tcp = uv.new_tcp()
+    if not tcp then
+      return nil
+    end
     local ok = tcp:bind(host, port) == 0
     local bound = ok and tcp:getsockname() or nil
     tcp:close()
@@ -107,10 +125,24 @@ end
 local children = {}
 M._children = children
 
--- Output chunks retained for error diagnosis; capped because the pipes stay
--- open for the child's whole lifetime (below), and a chatty backend must
--- not grow this without bound. The TAIL is what error reports show.
+-- Output chunks retained for error diagnosis, keyed like `children`: with
+-- concurrent sessions a shared buffer let a second launch wipe the first's
+-- captured output and interleave both backends' writes. Entries are NOT
+-- cleared in kill_child -- error paths kill the child first and read the
+-- output after -- so they persist until a re-launch on the same key; each
+-- is capped because the pipes stay open for the child's whole lifetime
+-- (below), and a chatty backend must not grow it without bound. The TAIL
+-- is what error reports show.
+local outputs = {}
 local MAX_OUTPUT_CHUNKS = 256
+
+-- Captured output for one backend, by the key its launch used. Tests hook
+-- this; the adapter's error formatting reads it by port.
+---@param key any port number, or the spec table for keyless callers
+---@return string[]? chunks raw output chunks, oldest first
+function M._output(key)
+  return outputs[key]
+end
 
 local function close_pipes(c)
   for _, pipe in ipairs({ c.stdout, c.stderr }) do
@@ -138,21 +170,65 @@ local function kill_all()
   end
 end
 
+-- Kills every backend when Neovim exits. nvim-dap's terminated/exited/
+-- disconnect listeners handle normal session teardown, but quitting the
+-- editor mid-session emits none of them -- without this hook the spawned
+-- miden-debug/miden-client would outlive Neovim as an orphan. Registered
+-- once, and only when the first child actually spawns (not at module
+-- load): merely requiring this module must stay side-effect free.
+local exit_hook_installed = false
+local function ensure_exit_hook()
+  if exit_hook_installed then
+    return
+  end
+  exit_hook_installed = true
+  vim.api.nvim_create_autocmd("VimLeavePre", {
+    group = vim.api.nvim_create_augroup("masm_dap_exit", { clear = true }),
+    callback = kill_all,
+  })
+end
+
 -- Spawns the backend and calls on_done(err) exactly once: nil when the
 -- readiness line appeared, a reason when the process errored, exited early
--- or timed out. Output is retained in M._last_output for diagnosis.
+-- or timed out. Output is retained per key (M._output) for diagnosis.
 --
 -- The stdout/stderr pipes are NOT closed at readiness: they stay open and
 -- drained until the process exits. Closing them at the handshake left the
 -- still-running backend with dead write ends, and Rust binaries
 -- (miden-debug is one) panic on the resulting EPIPE from println! -- one
 -- log line after the handshake would kill the debug session mid-flight.
+---@param spec masm.DapLaunchSpec
+---@param on_done fun(err: string?) called exactly once, on the main loop
+---@param timeout_ms integer? defaults to READY_TIMEOUT_MS
+---@param key any? children/outputs key (the port); defaults to `spec`
 function M._start_adapter(spec, on_done, timeout_ms, key)
   key = key or spec -- callers without an endpoint get a private key
   kill_child(key) -- a re-launch on the same endpoint replaces its backend
-  M._last_output = {}
+  -- A fresh table per launch, closed over below: a replaced backend's still-
+  -- draining pipes must not write into its successor's buffer.
+  local output = {}
+  outputs[key] = output
   local stdout, stderr = uv.new_pipe(false), uv.new_pipe(false)
   local timer = uv.new_timer()
+  -- Any of these can fail under fd exhaustion; report it like a failed
+  -- spawn (the closures below may then assume non-nil handles).
+  if not (stdout and stderr and timer) then
+    -- Explicit per-handle closes: an ipairs over { stdout, stderr, timer }
+    -- would stop at the first nil hole and leak the handles after it.
+    if stdout then
+      stdout:close()
+    end
+    if stderr then
+      stderr:close()
+    end
+    if timer then
+      timer:close()
+    end
+    vim.schedule(function()
+      on_done("could not allocate pipes for " .. spec.cmd .. " (out of file descriptors?)")
+    end)
+    return
+  end
   local done = false
   local function finish(err)
     if done then
@@ -170,7 +246,7 @@ function M._start_adapter(spec, on_done, timeout_ms, key)
   end
 
   local handle
-  handle, _ = uv.spawn(spec.cmd, {
+  handle = uv.spawn(spec.cmd, {
     args = spec.args,
     cwd = spec.cwd,
     stdio = { nil, stdout, stderr },
@@ -195,12 +271,13 @@ function M._start_adapter(spec, on_done, timeout_ms, key)
     return
   end
   children[key] = { handle = handle, stdout = stdout, stderr = stderr }
+  ensure_exit_hook()
 
   local function on_read(_, data)
     if data then
-      M._last_output[#M._last_output + 1] = data
-      if #M._last_output > MAX_OUTPUT_CHUNKS then
-        table.remove(M._last_output, 1)
+      output[#output + 1] = data
+      if #output > MAX_OUTPUT_CHUNKS then
+        table.remove(output, 1)
       end
       if not done and data:find(READY_PATTERN, 1, true) then
         finish(nil)
@@ -254,7 +331,7 @@ local function adapter(callback, config)
   end
   M._start_adapter(spec, function(err)
     if err then
-      local tail = table.concat(M._last_output or {}):sub(-800)
+      local tail = table.concat(M._output(port) or {}):sub(-800)
       vim.notify("masm dap: " .. err .. (tail ~= "" and ("\n" .. tail) or ""), vim.log.levels.ERROR)
       callback(nil)
       return
@@ -325,7 +402,9 @@ end
 
 -- Registers the adapter, default configurations, the miden/uiState listener
 -- and :MasmDapState with nvim-dap. Idempotent; safe to call from every masm
--- buffer. Returns true, or false and a reason (shown by :checkhealth masm).
+-- buffer.
+---@return boolean ok
+---@return string? reason why registration stayed off (:checkhealth masm)
 function M.register()
   if registered then
     return true
@@ -388,6 +467,7 @@ end
 
 -- Exposed for tests and health. _kill(key) kills one backend, _kill() all.
 M._render_state = render_state
+---@param key any? port of the backend to kill; nil kills every backend
 M._kill = function(key)
   if key ~= nil then
     kill_child(key)

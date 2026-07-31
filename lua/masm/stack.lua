@@ -25,11 +25,56 @@
 --  * Handwritten trackers are checked by WIDTH only; names are display
 --    material (they carry primes, rebindings and synonyms in the wild) and
 --    are adopted into the simulation when widths agree.
+--  * Refreshes must be cheap, never different: per-procedure results are
+--    memoized (see "Per-procedure memoization") strictly as a replay of
+--    what a cold pass would compute -- every cache in this module is keyed
+--    or validated so that a warm result is bit-identical to a cold one.
 
 local notation = require("masm.stacknotation")
 local arity = require("masm.arity")
+local util = require("masm.util")
 
 local M = {}
+
+---@class masm.StackCell one felt on the simulated stack
+---@field name string? display name (nil = anonymous)
+---@field origin string? "input"|"literal"|"computed"|"callee"|"caller"|"comment"|"zerofill"|"merge"|"unknown"
+---@field lane integer? 0-based lane inside a word/span group
+---@field group {kind: string, name: string, width: integer}? display grouping
+
+---@class masm.StackState
+---@field cells masm.StackCell[] top-first
+---@field mode '"floored"'|'"relative"'
+---@field consumed integer felts drawn from beneath the declared inputs (relative)
+---@field poisoned string? reason the suffix is unknowable
+---@field bottom boolean this path diverges (provably-failing assertion)
+---@field renormalized boolean a call/dyncall/syscall ran on this path
+---@field floor_debt integer zeros the 16-floor has pulled in so far (floored)
+
+---@class masm.StackDiagnostic
+---@field lnum integer 1-based line
+---@field col integer
+---@field severity '"error"'|'"warn"'|'"hint"'
+---@field code string e.g. "exit-depth", "comment-stale", "abi-16"
+---@field message string
+
+---@class masm.StackProc a scanned (and possibly analyzed) procedure
+---@field name string
+---@field lnum integer declaration line
+---@field body_lnum integer? first body line
+---@field end_lnum integer? matching `end` line
+---@field doc_lnum integer first line of the `#!` doc block
+---@field contract table parsed doc contract (masm.stacknotation)
+---@field attrs string[] `@` attributes above the declaration
+---@field invocation string? "exec"|"call"|"syscall"|"dyncall"|"dynexec"|"entrypoint"
+---@field bailed string? reason the whole proc was not simulated
+---@field diagnostics masm.StackDiagnostic[]
+---@field states table<integer, masm.StackState> per-line snapshots
+---@field exit masm.StackState?
+
+---@class masm.StackResult
+---@field procs masm.StackProc[]
+---@field diagnostics masm.StackDiagnostic[]
 
 -- Per-procedure simulated-instruction budget (repeat unrolling included).
 -- Real procedures are 5-50 instructions; the cap only exists so a
@@ -38,6 +83,10 @@ local MAX_SIM_OPS = 10000
 -- Distinct cross-file callee/constant lookups per analyze() pass. Lookups
 -- hit goto's mtime-keyed caches after the first pass; the cap bounds the
 -- cold-start worst case. Beyond it, affected procs poison with a reason.
+-- Distinct is load-bearing (budget_lookup): a target already counted this
+-- pass never ticks again -- a repeat lookup is a pure cache hit, and a
+-- total count would let 400 `push.CONST`s of one constant starve genuine
+-- diagnostics later in the file.
 local MAX_LOOKUPS = 300
 -- Visible cells tracked per state; deeper stacks are legal but not useful
 -- to model (nothing in real code addresses that deep).
@@ -110,7 +159,11 @@ end
 
 -- Guarantees at least n cells, drawing from the zero-fill floor (floored
 -- mode) or the caller's stack (relative mode; the draw is counted for the
--- caller-underflow check).
+-- caller-underflow check). Draws made while the state is poisoned are NOT
+-- counted: the suffix is unknowable there, so a phantom cell conjured under
+-- a poison is not attributable to the caller's declared Inputs -- counting
+-- it made caller-underflow fire on states the analyzer had already declared
+-- unknowable, and no `# => [...]` resync could clear the tally.
 local function ensure_cells(state, n, ctx, lnum)
   local have = #state.cells
   if have >= n then
@@ -126,10 +179,12 @@ local function ensure_cells(state, n, ctx, lnum)
     for _, c in ipairs(anon_cells(need, "caller")) do
       state.cells[#state.cells + 1] = c
     end
-    if state.consumed == 0 and ctx then
-      ctx.first_draw_lnum = ctx.first_draw_lnum or lnum
+    if not state.poisoned then
+      if state.consumed == 0 and ctx then
+        ctx.first_draw_lnum = ctx.first_draw_lnum or lnum
+      end
+      state.consumed = state.consumed + need
     end
-    state.consumed = state.consumed + need
   end
 end
 
@@ -224,19 +279,55 @@ local function doc_block_above(lines, lnum)
   return doc, attrs, first
 end
 
+-- Blanks every line once (util.code_only). Scanning and event building both
+-- consume blanked lines; computing them a single time per pass (instead of
+-- re-blanking per consumer, which one refresh used to do three or four
+-- times) is the analyzer's single-pass text prep.
+local function blank_lines(lines)
+  local out = {}
+  for i = 1, #lines do
+    out[i] = util.code_only(lines[i])
+  end
+  return out
+end
+
+-- Doc-block contract parse, memoized by the block's exact text: every scan
+-- pass re-reads all ~doc blocks of the buffer, and notation.contract's
+-- per-element parsing was a measurable slice of the refresh. Contract
+-- tables are treated as immutable everywhere (nothing writes to a parsed
+-- contract), so sharing one table between identical doc blocks is safe.
+-- Pure function of the doc text; bounded like every cache here.
+local contract_memo = util.new_cache(8192)
+local function contract_of(doc)
+  local key = table.concat(doc, "\n")
+  local hit = contract_memo:get(key)
+  if hit then
+    return hit
+  end
+  local contract = notation.contract(doc)
+  contract_memo:put(key, contract)
+  return contract
+end
+
 -- Scans a file's lines for proc declarations and their doc contracts.
 -- Shared between the current buffer and callee files (contract cache).
+-- `code_lines` is the blanked twin of `lines` (blank_lines).
 -- Returns { by_lnum = { [decl_lnum] = proc } , list = { proc... } } where
 -- proc = { name, lnum, end_lnum, doc_lnum, contract, attrs, invocation }.
-local function scan_procs(lines, code_only)
+local function scan_procs(lines, code_lines)
   local by_lnum, list = {}, {}
   local i = 1
   while i <= #lines do
-    local code = code_only(lines[i])
-    local decl = code:match("^%s*pub%s+proc%f[^%w_]") or code:match("^%s*proc%f[^%w_]")
-    local is_begin = code:match("^%s*begin%f[^%w_]") ~= nil
+    local code = code_lines[i]
+    -- Plain-find pre-filters: the anchored patterns cannot match without
+    -- the keyword substring, and a find is far cheaper than the matches on
+    -- the vast majority of lines that declare nothing.
+    local decl = code:find("proc", 1, true)
+        and (code:match("^%s*pub%s+proc%f[^%w_]") or code:match("^%s*proc%f[^%w_]"))
+      or nil
+    local is_begin = (code:find("begin", 1, true) and code:match("^%s*begin%f[^%w_]")) ~= nil
     if decl or is_begin then
-      local name = decl and code:match("proc%s+([%w_%$]+)") or "begin"
+      local name = decl and code:match("proc%s+(" .. util.IDENT .. ")") or "begin"
       local doc, attrs, doc_lnum = doc_block_above(lines, i)
       -- A typed signature may wrap over several lines; the body starts
       -- after its parentheses balance.
@@ -251,7 +342,7 @@ local function scan_procs(lines, code_only)
         end
         local bal = paren_delta(code)
         while bal > 0 and body_first <= #lines do
-          bal = bal + paren_delta(code_only(lines[body_first]))
+          bal = bal + paren_delta(code_lines[body_first])
           body_first = body_first + 1
         end
       end
@@ -267,15 +358,15 @@ local function scan_procs(lines, code_only)
         rest = code:match("^%s*begin%f[^%w_](.*)$")
         rest_lnum = i
       elseif not code:find("%(") then
-        rest = code:match("^%s*pub%s+proc%s+[%w_%$]+(.*)$")
-          or code:match("^%s*proc%s+[%w_%$]+(.*)$")
+        rest = code:match("^%s*pub%s+proc%s+" .. util.IDENT .. "(.*)$")
+          or code:match("^%s*proc%s+" .. util.IDENT .. "(.*)$")
         rest_lnum = i
       else
         -- Typed signature: the remainder follows the last `)` of the line
         -- where the parens balanced (body_first - 1; equals `i` when they
         -- balance on the declaration line itself).
         rest_lnum = body_first - 1
-        local closed = rest_lnum == i and code or code_only(lines[rest_lnum])
+        local closed = rest_lnum == i and code or code_lines[rest_lnum]
         rest = closed:match(".*%)(.*)$")
       end
       if rest and rest:match("^%s*%->") then
@@ -301,15 +392,46 @@ local function scan_procs(lines, code_only)
         end
       end
       local j = body_first
+      -- Set when a NEW declaration line appears before this proc's `end`:
+      -- MASM has no nested procedures, so a `proc`/`begin` line inside the
+      -- body can only mean the `end` above it is missing. Ending the search
+      -- there (instead of letting the unterminated proc swallow the next
+      -- declaration and steal ITS `end`) keeps every following procedure
+      -- independently analyzable while the author is still typing the one
+      -- above; the unterminated proc itself is reported by analyze_proc's
+      -- missing-end diagnostic.
+      local truncated_at
       while not end_lnum and j <= #lines do
-        for tok in code_only(lines[j]):gmatch("%S+") do
-          if opens_block(tok) then
-            depth = depth + 1
-          elseif tok == "end" then
-            depth = depth - 1
-            if depth == 0 then
-              end_lnum = j
-              break
+        local cl = code_lines[j]
+        if
+          (
+            cl:find("proc", 1, true)
+            and (cl:match("^%s*pub%s+proc%f[^%w_]") or cl:match("^%s*proc%f[^%w_]"))
+          ) or (cl:find("begin", 1, true) and cl:match("^%s*begin%f[^%w_]"))
+        then
+          truncated_at = j
+          break
+        end
+        -- Plain-find pre-filter: only tokenize lines that can contain a
+        -- block token (every opens_block token contains "if.", "while." or
+        -- "repeat.", and closing needs "end"). False positives -- e.g. a
+        -- path segment like `exec.foo::send` -- just take the exact
+        -- tokenizing path below; they can never be missed.
+        if
+          cl:find("end", 1, true)
+          or cl:find("if.", 1, true)
+          or cl:find("while.", 1, true)
+          or cl:find("repeat.", 1, true)
+        then
+          for tok in cl:gmatch("%S+") do
+            if opens_block(tok) then
+              depth = depth + 1
+            elseif tok == "end" then
+              depth = depth - 1
+              if depth == 0 then
+                end_lnum = j
+                break
+              end
             end
           end
         end
@@ -318,7 +440,7 @@ local function scan_procs(lines, code_only)
         end
         j = j + 1
       end
-      local contract = notation.contract(doc)
+      local contract = contract_of(doc)
       -- `begin..end` is the program entrypoint: it always runs on the
       -- 16-element physical stack, whatever the doc block says.
       local invocation = is_begin and "entrypoint" or contract.invocation
@@ -363,7 +485,10 @@ local function scan_procs(lines, code_only)
         by_lnum[i] = proc
       end
       list[#list + 1] = proc
-      i = (end_lnum or #lines) + 1
+      -- Resume at the declaration that truncated an unterminated proc, so
+      -- the procs below it are scanned normally; only a proc with neither
+      -- an `end` nor a following declaration runs to end-of-file.
+      i = end_lnum and (end_lnum + 1) or truncated_at or (#lines + 1)
     else
       i = i + 1
     end
@@ -375,37 +500,43 @@ end
 -- Contract cache for callee files
 ---------------------------------------------------------------------------
 
-local contract_cache = {}
-local lines_cache = {}
+-- Bounded (one entry per callee file; the generous cap is pure overflow
+-- armor -- see util.new_cache for the full-clear-on-overflow reasoning).
+local contract_cache = util.new_cache(10000)
+local lines_cache = util.new_cache(10000)
+-- Per-procedure analysis memo (see "Per-procedure memoization" below).
+local proc_cache = util.new_cache(8192)
+-- Hit/miss counters for the memo, exposed for tests (they assert WHICH
+-- procs re-analyze, not just what the result is) and for profiling.
+M._memo_stats = { hits = 0, misses = 0 }
 
 function M.clear_cache()
-  contract_cache = {}
-  lines_cache = {}
-end
-
-local function goto_mod()
-  return require("masm.goto")
+  contract_cache:clear()
+  lines_cache:clear()
+  proc_cache:clear()
+  -- Content-keyed and therefore never stale, but :MasmRebuildIndex promises
+  -- to drop the caches wholesale -- honor the documented contract.
+  contract_memo:clear()
 end
 
 -- Scanned procs (declarations + doc contracts) of an on-disk file, cached
 -- under its freshness key.
 local function file_procs(path)
-  local g = goto_mod()
-  local key = g._stat_key(path)
+  local key = util.stat_key(path)
   if not key then
     return nil, "cannot stat " .. path
   end
-  local hit = contract_cache[path]
+  local hit = contract_cache:get(path)
   if hit and hit.key == key then
     return hit.procs
   end
-  local text = g._read_file(path)
+  local text = util.read_file(path)
   if not text then
     return nil, "cannot read " .. path
   end
   local lines = vim.split(text, "\n", { plain = true })
-  local procs = scan_procs(lines, g._code_only)
-  contract_cache[path] = { key = key, procs = procs }
+  local procs = scan_procs(lines, blank_lines(lines))
+  contract_cache:put(path, { key = key, procs = procs })
   return procs
 end
 
@@ -421,6 +552,9 @@ end
 -- Compact `[inputs] -> [outputs]` summary of the procedure declared at
 -- `path`:`lnum`, in the author's own notation, or nil when the file has no
 -- parseable contract there. Cache-backed; used by masm.complete menus.
+---@param path string
+---@param lnum integer declaration line
+---@return string? summary
 function M.contract_summary(path, lnum)
   local procs = file_procs(path)
   local proc = procs and procs.by_lnum[lnum]
@@ -435,8 +569,10 @@ end
 -- `lines`, returning name -> { lnum, summary }. Not cached -- completion
 -- calls are user-paced and a scan of a real file is well under a
 -- millisecond.
+---@param lines string[]
+---@return table<string, {lnum: integer, summary: string?}>
 function M.buffer_proc_summaries(lines)
-  local procs = scan_procs(lines, goto_mod()._code_only)
+  local procs = scan_procs(lines, blank_lines(lines))
   local out = {}
   for _, proc in ipairs(procs.list) do
     local c = proc.contract
@@ -449,13 +585,41 @@ function M.buffer_proc_summaries(lines)
   return out
 end
 
--- Resolves an invocation target to its contract via goto's resolver.
--- Returns contract, nil on success; nil, reason otherwise.
-local function callee_contract(ctx, target, kind)
-  if ctx.lookups > MAX_LOOKUPS then
-    return nil, "cross-file lookup budget exhausted"
+local BUDGET_REASON = "cross-file lookup budget exhausted"
+
+-- One key per distinct lookup target, shared verbatim by the raw lookups'
+-- budget accounting (budget_lookup) and deps_fresh's replay/val_memo, so
+-- "distinct" means exactly the same thing on the cold path and in memo
+-- validation.
+local function lookup_key(t, target, kind)
+  return t .. "\1" .. target .. "\1" .. tostring(kind)
+end
+
+-- The budget tick for one raw lookup. Only a target not yet counted this
+-- pass draws the budget (MAX_LOOKUPS counts DISTINCT lookups; repeats are
+-- cache hits that cost nothing). Returns false when the budget refuses --
+-- without counting the target, so a refused target keeps refusing for the
+-- rest of the pass (the budget never shrinks): every lookup of one target
+-- gets the same budget outcome within a pass, which deps_fresh's val_memo
+-- relies on.
+local function budget_lookup(ctx, key)
+  if ctx.counted[key] then
+    return true
   end
+  if ctx.lookups > MAX_LOOKUPS then
+    return false
+  end
+  ctx.counted[key] = true
   ctx.lookups = ctx.lookups + 1
+  return true
+end
+
+-- Resolves an invocation target to its contract via goto's resolver.
+-- Returns contract, nil on success; nil, reason otherwise. The `_core`
+-- form is budget-free (memo validation replays the budget itself and
+-- memoizes core answers per pass); `_raw` adds the per-pass lookup budget
+-- and is what analysis goes through.
+local function callee_contract_core(ctx, target, kind)
   local item, reason = ctx.resolver(target, kind)
   if not item then
     return nil, reason or (target .. " not resolved")
@@ -471,35 +635,73 @@ local function callee_contract(ctx, target, kind)
   return proc.contract
 end
 
+local function callee_contract_raw(ctx, target, kind)
+  if not budget_lookup(ctx, lookup_key("callee", target, kind)) then
+    return nil, BUDGET_REASON
+  end
+  return callee_contract_core(ctx, target, kind)
+end
+
+-- Everything a caller-side transition can consume from a callee contract:
+-- the raw Inputs/Outputs spellings (the parsed lists and the names spliced
+-- into cells derive deterministically from them) and the reason strings
+-- (they appear verbatim in hint messages and poison reasons). A resolution
+-- failure signs as its reason, so "resolved to a different file/proc" and
+-- "stopped resolving" both change the signature.
+local function contract_sig(contract, reason)
+  if not contract then
+    return "nil:" .. tostring(reason)
+  end
+  return tostring(contract.inputs_raw)
+    .. "|"
+    .. tostring(contract.inputs_reason)
+    .. "|"
+    .. tostring(contract.outputs_raw)
+    .. "|"
+    .. tostring(contract.outputs_reason)
+end
+
+-- Recording wrapper: every lookup a procedure's analysis performs is
+-- appended to ctx.deps with a signature of what it observed, so the memo
+-- (proc_cache) can later ask "would this lookup answer the same today?"
+-- without re-simulating. One dep is recorded per raw call -- including
+-- budget-refused ones -- so replaying deps reproduces the lookup budget's
+-- cold-pass accounting exactly.
+local function callee_contract(ctx, target, kind)
+  local contract, reason = callee_contract_raw(ctx, target, kind)
+  local deps = ctx.deps
+  if deps then
+    deps[#deps + 1] =
+      { t = "callee", target = target, kind = kind, sig = contract_sig(contract, reason) }
+  end
+  return contract, reason
+end
+
 -- Raw lines of an on-disk file for constant-definition lookups, cached
 -- under the file's freshness key like every other callee lookup (an
 -- analysis pass may resolve many `push.CONST`s against the same module).
 local function file_lines_cached(path)
-  local g = goto_mod()
-  local key = g._stat_key(path)
+  local key = util.stat_key(path)
   if not key then
     return nil, "cannot stat " .. path
   end
-  local hit = lines_cache[path]
+  local hit = lines_cache:get(path)
   if hit and hit.key == key then
     return hit.lines
   end
-  local text = g._read_file(path)
+  local text = util.read_file(path)
   if not text then
     return nil, "cannot read " .. path
   end
   local lines = vim.split(text, "\n", { plain = true })
-  lines_cache[path] = { key = key, lines = lines }
+  lines_cache:put(path, { key = key, lines = lines })
   return lines
 end
 
 -- Resolves `push.CONST`: how many felts does the constant push?
 -- A `word("...")` constant pushes 4; any other single value pushes 1.
-local function const_width(ctx, name)
-  if ctx.lookups > MAX_LOOKUPS then
-    return nil, "cross-file lookup budget exhausted"
-  end
-  ctx.lookups = ctx.lookups + 1
+-- `_core`/`_raw`/wrapper split for the same reason as callee_contract.
+local function const_width_core(ctx, name)
   local item, reason = ctx.resolver(name, nil)
   if not item then
     return nil, reason or (name .. " not resolved")
@@ -532,6 +734,29 @@ local function const_width(ctx, name)
   return 1
 end
 
+local function const_width_raw(ctx, name)
+  if not budget_lookup(ctx, lookup_key("const", name, nil)) then
+    return nil, BUDGET_REASON
+  end
+  return const_width_core(ctx, name)
+end
+
+-- The signature is the observed width or the failure reason: the width is
+-- all the simulation consumes, and the reason appears verbatim in the
+-- poison message.
+local function const_sig(width, reason)
+  return width and ("w:" .. width) or ("e:" .. tostring(reason))
+end
+
+local function const_width(ctx, name)
+  local width, reason = const_width_raw(ctx, name)
+  local deps = ctx.deps
+  if deps then
+    deps[#deps + 1] = { t = "const", target = name, sig = const_sig(width, reason) }
+  end
+  return width, reason
+end
+
 ---------------------------------------------------------------------------
 -- Events: instruction tokens and tracker comments in buffer order
 ---------------------------------------------------------------------------
@@ -540,14 +765,16 @@ local function build_events(ctx, first, last)
   local events = {}
   local lines = ctx.lines
   for lnum = first, last do
-    local code = ctx.code_only(lines[lnum])
+    local code = ctx.code_lines[lnum]
     for tok in code:gmatch("%S+") do
       events[#events + 1] = { kind = "op", tok = tok, lnum = lnum }
     end
     local comment = notation.comment_part(lines[lnum])
     if comment then
       local ckind, value = notation.tracker_kind(comment)
-      if ckind == "tracker" then
+      -- "tracker" always carries a value; the `and value` spells that out
+      -- for flow analysis (the two returns cannot be tied in a signature).
+      if ckind == "tracker" and value then
         local joined = notation.join_value(value, lines, lnum)
         if joined then
           local bracket = joined:match("^(%b[])")
@@ -595,7 +822,11 @@ end
 -- out-of-range index (`movup.99`) would model code that cannot assemble --
 -- and in relative mode manufacture a phantom caller draw, up to a bogus
 -- caller-underflow diagnostic. Out of range bails the proc with a reason,
--- exactly like an unknown mnemonic.
+-- exactly like an unknown mnemonic. arity.special bases ABSENT from this
+-- table (swapdw, reversew, reversedw) take no index at all: the bundled
+-- instruction reference documents them in bare form only (no `.{n}`
+-- variant exists for the assembler to accept), so ANY immediate on them
+-- bails the same way.
 local SPECIAL_RANGE = {
   swap = { 1, 15 },
   movup = { 2, 15 },
@@ -673,10 +904,10 @@ local function apply_special(base, n, state, ctx, lnum)
     for i = 1, 4 do
       cells[i], cells[9 - i] = cells[9 - i], cells[i]
     end
-  else
-    return false
   end
-  return true
+  -- No fallthrough handling: the only caller dispatches on arity.special,
+  -- and every base in that table has a branch above, so an unmatched base
+  -- cannot reach here (a formerly present `return false` was dead code).
 end
 
 -- Names a computed result from an `expr` template and the popped operands.
@@ -716,7 +947,8 @@ local function split_push_imm(s)
   return parts
 end
 
-local function apply_push(state, imm, ctx, lnum)
+-- _lnum: unused here but kept so the handler matches the dispatch signature.
+local function apply_push(state, imm, ctx, _lnum)
   if not imm then
     return nil, "push requires an immediate"
   end
@@ -819,8 +1051,21 @@ local function apply_op(state, tok, ctx, lnum)
       local why = reason
         or (contract and (contract.inputs_reason or contract.outputs_reason))
         or "no Inputs/Outputs contract"
+      -- The callee-unresolved hint is deduplicated ACROSS procedures via
+      -- shared reported_callees, so whether this proc emits it depends on
+      -- what earlier procs did. Record that pass-order coupling on the dep:
+      -- `rb` (was it already reported when consulted) must still hold for a
+      -- memo hit to be sound, and `claimed` lets a hit re-mark the target so
+      -- later procs in the same pass dedupe exactly as a cold pass would.
+      local dep = ctx.deps and ctx.deps[#ctx.deps]
+      if dep then
+        dep.rb = ctx.reported_callees[imm] == true
+      end
       if not ctx.reported_callees[imm] then
         ctx.reported_callees[imm] = true
+        if dep then
+          dep.claimed = true
+        end
         diag(
           ctx,
           lnum,
@@ -902,7 +1147,7 @@ local function apply_op(state, tok, ctx, lnum)
     if not imm then
       return nil, "procref requires a target"
     end
-    local short = imm:match("([%w_%$]+)$") or imm
+    local short = imm:match("(" .. util.IDENT .. ")$") or imm
     local gname = short:upper() .. "_ROOT"
     local group = { kind = "word", name = gname, width = 4 }
     local cells = {}
@@ -917,7 +1162,11 @@ local function apply_op(state, tok, ctx, lnum)
   end
 
   -- Decorators: dotted suffixes are subcommands, never arity immediates.
-  if base == "debug" or base == "trace" or base == "adv" or base == "emit" then
+  -- `emit` is deliberately NOT intercepted here: arity.ops.emit ({0, 0} in
+  -- both bare and immediate form) is its one source of truth, keeping the
+  -- consistency test's arity/reference/highlight link live instead of
+  -- shadowing the table entry dead.
+  if base == "debug" or base == "trace" or base == "adv" then
     return true
   end
 
@@ -931,6 +1180,11 @@ local function apply_op(state, tok, ctx, lnum)
       return nil, ("%s requires an index"):format(base)
     end
     local range = SPECIAL_RANGE[base]
+    if n and not range then
+      -- No entry means no immediate form exists (see SPECIAL_RANGE):
+      -- `swapdw.3` cannot assemble any more than `movup.99` can.
+      return nil, ("%s: %s takes no index immediate"):format(tok, base)
+    end
     if n and range and (n % 1 ~= 0 or n < range[1] or n > range[2]) then
       return nil, ("%s: index outside the assembler's %d..%d range"):format(tok, range[1], range[2])
     end
@@ -957,10 +1211,11 @@ local function apply_op(state, tok, ctx, lnum)
   end
   local pops, pushes = effective[1], effective[2]
   if pushes == "n" then
-    pushes = tonumber(imm)
-    if not pushes then
+    local count = tonumber(imm)
+    if not count then
       return nil, ("non-numeric count on %s"):format(tok)
     end
+    pushes = count --[[@as integer]]
   end
   local popped = pop_cells(state, pops, ctx, lnum)
   -- A provably failing assertion marks the path as diverging: `push.0
@@ -1470,12 +1725,29 @@ end
 
 local function analyze_proc(ctx)
   local proc = ctx.proc
-  if not proc.invocation then
-    proc.bailed = "no #! Invocation annotation (and no script attribute)"
+  -- Checked BEFORE the invocation gate: an end-less proc is a syntax error
+  -- the assembler rejects whatever its invocation mode is, so this cannot
+  -- false-positive on valid code -- which is why it may be a real WARN
+  -- diagnostic and not just a bail reason. It must be one: bail reasons
+  -- only surface as overlay ghost text (off by default), and this state is
+  -- exactly what the buffer looks like while a new proc is being typed
+  -- above existing code -- losing it silently would break the "never
+  -- guess, always state a reason" contract at the UI.
+  if not proc.end_lnum then
+    proc.bailed = "missing `end`"
+    diag(
+      ctx,
+      proc.lnum,
+      "warn",
+      "missing-end",
+      ("%s has no matching `end`; the assembler rejects this, and its body is not analyzed"):format(
+        proc.name == "begin" and "this begin block" or ("procedure " .. proc.name)
+      )
+    )
     return
   end
-  if not proc.end_lnum then
-    proc.bailed = "unterminated procedure"
+  if not proc.invocation then
+    proc.bailed = "no #! Invocation annotation (and no script attribute)"
     return
   end
   if proc.same_line_body then
@@ -1578,7 +1850,13 @@ local function analyze_proc(ctx)
         ("body leaves %d element(s) but Outputs declares %d"):format(#state.cells, c.outputs.width)
       )
     end
-    if state.consumed > 0 and not ctx.inexact then
+    -- `not state.poisoned` mirrors the exec-net check above -- defense in
+    -- depth: ensure_cells never counts draws made under a poison, so this
+    -- only differs when the poison arrived AFTER real draws. Even those stay
+    -- unreported at a poisoned exit: never warn on a state the analyzer
+    -- declared unknowable (a `# => [...]` resync clears the poison, and the
+    -- tally of real draws then speaks again).
+    if state.consumed > 0 and not state.poisoned and not ctx.inexact then
       diag(
         ctx,
         ctx.first_draw_lnum or proc.end_lnum,
@@ -1593,36 +1871,252 @@ local function analyze_proc(ctx)
 end
 
 ---------------------------------------------------------------------------
+-- Per-procedure memoization
+---------------------------------------------------------------------------
+-- A procedure's analysis is a pure function of (a) its own source slice and
+-- (b) the answers its cross-proc lookups returned. On a typical edit only
+-- the touched proc's slice changes, so everything else can be replayed from
+-- proc_cache instead of re-simulated. The key is (a); (b) is validated per
+-- hit by re-asking each recorded lookup (deps_fresh) -- lookups are
+-- freshness-cached in goto/resolve, so validation is cheap, and threading
+-- them through the KEY instead would miss on every unrelated buffer edit.
+
+-- The key's source slice must cover every line the analysis can read:
+--  * the contiguous `#`/`@` block above the declaration -- a superset of
+--    what doc_block_above consults (contract, attrs, and the plain comments
+--    it skips over), so an attribute-only proc (no `#!` block) still keys
+--    on its `@note_script` line;
+--  * the declaration through its `end`;
+--  * up to MAX_JOIN_LINES trailing comment lines: a tracker on the `end`
+--    line itself may join_value into them.
+-- Content-only (no line numbers): edits ABOVE a proc shift it without
+-- changing its analysis, so hits survive and results are rebased by the
+-- declaration-line delta. The path is included because resolution of the
+-- same source text differs per file.
+local function proc_cache_key(path, lines, proc)
+  if not proc.end_lnum then
+    -- Unterminated: no definite extent to key on. Never caching these is
+    -- also what keeps the missing-end outcome sound -- the truncated slice
+    -- (declaration to the next declaration) has no stable content key, and
+    -- re-deriving the bail + warn each pass is as cheap as a memo hit.
+    return nil
+  end
+  local first = proc.lnum
+  while first > 1 and lines[first - 1]:match("^%s*[#@]") do
+    first = first - 1
+  end
+  local last = proc.end_lnum
+  local stop = math.min(#lines, proc.end_lnum + notation.MAX_JOIN_LINES)
+  while last < stop and lines[last + 1]:match("^%s*#") do
+    last = last + 1
+  end
+  return path .. "\1" .. table.concat(lines, "\n", first, last)
+end
+
+-- True when every recorded lookup would answer with the same signature
+-- today, i.e. the cached analysis is still what a cold pass would compute.
+-- Deps are replayed in recorded order against the pass's CUMULATIVE lookup
+-- budget (one dep was recorded per raw lookup, refused ones included, and
+-- validated hits sync their accounting back), with budget_lookup's exact
+-- distinct-target semantics: a dep whose target is already counted -- by an
+-- earlier proc of the pass or earlier in this replay -- ticks nothing, a
+-- new target ticks once, and only an uncounted target can be refused. The
+-- budget therefore stands at exactly the value a cold pass would have at
+-- every replayed lookup: a dep that was budget-refused when analyzed
+-- validates precisely when the replay refuses at the same point, and a
+-- refusal can never appear where a cold pass would not have had one. On a
+-- validation failure nothing is synced and the proc re-analyzes from the
+-- same cumulative accounting a cold pass would reach it with.
+local function deps_fresh(deps, shared)
+  local vctx = setmetatable({ lookups = shared.lookups }, { __index = shared })
+  local memo = shared.val_memo
+  -- Targets this replay newly counts against the budget, staged apart from
+  -- shared.counted (which vctx would otherwise mutate through its __index):
+  -- on a validation failure nothing may leak into the pass-wide accounting
+  -- -- the re-analysis performs the real raw lookups and counts them itself.
+  local counted_new = {}
+  -- Claims this proc itself made, in dep order: a proc with TWO execs of
+  -- the same unresolved callee recorded rb=false then rb=true, and the
+  -- second must be checked against the state as of the first (shared
+  -- reported_callees is only updated after the whole proc validates).
+  local claimed = {}
+  for _, dep in ipairs(deps) do
+    -- The budget guard is replayed here (not inside the lookup): the
+    -- current answer for a given target is pass-constant and memoized in
+    -- shared.val_memo, so each distinct target is looked up once per pass
+    -- however many procs depend on it -- but the budget accounting must
+    -- still mirror budget_lookup's per replayed dep to stay in cold-pass
+    -- lockstep.
+    local mkey = lookup_key(dep.t, dep.target, dep.kind)
+    local counted = shared.counted[mkey] or counted_new[mkey]
+    local sig_now
+    if not counted and vctx.lookups > MAX_LOOKUPS then
+      sig_now = (dep.t == "callee") and contract_sig(nil, BUDGET_REASON)
+        or const_sig(nil, BUDGET_REASON)
+    else
+      if not counted then
+        counted_new[mkey] = true
+        vctx.lookups = vctx.lookups + 1
+      end
+      sig_now = memo[mkey]
+      if not sig_now then
+        if dep.t == "callee" then
+          sig_now = contract_sig(callee_contract_core(vctx, dep.target, dep.kind))
+        else
+          sig_now = const_sig(const_width_core(vctx, dep.target))
+        end
+        memo[mkey] = sig_now
+      end
+    end
+    if sig_now ~= dep.sig then
+      return false
+    end
+    -- Pass-order coupling of the callee-unresolved hint (see apply_op):
+    -- the hint's presence/absence in the cached diagnostics is only valid
+    -- if the target's reported state is the same as when it was analyzed.
+    if dep.rb ~= nil then
+      local reported = shared.reported_callees[dep.target] == true or claimed[dep.target] == true
+      if reported ~= dep.rb then
+        return false
+      end
+      if dep.claimed then
+        claimed[dep.target] = true
+      end
+    end
+  end
+  shared.lookups = vctx.lookups
+  for k in pairs(counted_new) do
+    shared.counted[k] = true
+  end
+  return true
+end
+
+-- What a hit must restore: outcome fields (bailed/exit/states/diagnostics)
+-- plus the base declaration line for rebasing. Bail reasons are the one
+-- outcome that can EMBED an absolute line number ("unknown instruction %q
+-- (line 42)", produced by sim_block's bail path only); the number is split
+-- out so a shifted hit can re-embed the shifted line.
+local function snapshot_proc(ctx)
+  local proc = ctx.proc
+  local snap = {
+    lnum = proc.lnum,
+    deps = ctx.deps,
+    bailed = proc.bailed,
+    exit = proc.exit,
+    states = proc.states,
+    diagnostics = proc.diagnostics,
+  }
+  if proc.bailed then
+    local line = proc.bailed:match("%(line (%d+)%)$")
+    if line then
+      snap.bailed_line = tonumber(line)
+      snap.bailed_prefix = proc.bailed:gsub("%s*%(line %d+%)$", "")
+    end
+  end
+  return snap
+end
+
+-- Rebases a cached outcome onto the freshly scanned `proc`. States and exit
+-- snapshots are shared by reference: cells are immutable by design (see the
+-- module header) and nothing mutates a state after analysis. Diagnostics
+-- are copied when shifted so the cached originals keep their coordinates.
+local function restore_proc(proc, snap, shared)
+  local delta = proc.lnum - snap.lnum
+  proc.exit = snap.exit
+  proc.bailed = snap.bailed
+  if snap.bailed_line then
+    proc.bailed = ("%s (line %d)"):format(snap.bailed_prefix, snap.bailed_line + delta)
+  end
+  if delta == 0 then
+    proc.states = snap.states
+    proc.diagnostics = snap.diagnostics
+  else
+    local states = {}
+    for lnum, state in pairs(snap.states) do
+      states[lnum + delta] = state
+    end
+    proc.states = states
+    local diags = {}
+    for i, d in ipairs(snap.diagnostics) do
+      diags[i] = {
+        lnum = d.lnum + delta,
+        col = d.col,
+        severity = d.severity,
+        code = d.code,
+        message = d.message,
+      }
+    end
+    proc.diagnostics = diags
+  end
+  -- Replay the hint claims so later procs in this pass dedupe identically.
+  for _, dep in ipairs(snap.deps) do
+    if dep.claimed then
+      shared.reported_callees[dep.target] = true
+    end
+  end
+end
+
+---------------------------------------------------------------------------
 -- Public API
 ---------------------------------------------------------------------------
 
 -- Analyzes `lines` as the content of the file at `path`. Pure with respect
 -- to the UI: no notifications, no buffer access; reasons travel in the
 -- result. Returns { procs = {...}, diagnostics = {...} } or nil, reason.
+---@param lines string[]
+---@param path string the file the lines belong to (anchors resolution)
+---@return masm.StackResult? result
+---@return string? reason
 function M.analyze_lines(lines, path)
-  local g = goto_mod()
-  local resolver, err = g.make_resolver(path, table.concat(lines, "\n"))
+  local buftext = table.concat(lines, "\n")
+  local code_lines = blank_lines(lines)
+  -- One blanking pass for the whole refresh: the resolver's import parse,
+  -- resolution internals and the drift canary all call code_text(buftext),
+  -- and the primed memo answers them from the per-line pass above.
+  util.prime_code_text(buftext, code_lines)
+  local resolver, err = require("masm.goto").make_resolver(path, buftext)
   if not resolver then
     return nil, err
   end
-  local local_procs = scan_procs(lines, g._code_only)
+  local local_procs = scan_procs(lines, code_lines)
   local result = { procs = local_procs.list, diagnostics = {} }
   local shared = {
     lines = lines,
     bufpath = path,
-    code_only = g._code_only,
+    code_lines = code_lines,
     resolver = resolver,
     local_procs = local_procs,
     lookups = 0,
+    -- Distinct-target set behind the lookup budget (budget_lookup): keys of
+    -- targets that already drew it this pass. Reads through ctx's __index
+    -- land here, so all procs of a pass share one tally.
+    counted = {},
     reported_callees = {},
+    -- Per-pass memo of current lookup signatures (deps_fresh): validation
+    -- asks about the same callee once per DEPENDENT proc, but the answer
+    -- within one pass is the same every time.
+    val_memo = {},
   }
   for _, proc in ipairs(local_procs.list) do
-    local ctx = setmetatable({ proc = proc }, { __index = shared })
-    analyze_proc(ctx)
+    local key = proc_cache_key(path, lines, proc)
+    local hit = key and proc_cache:get(key) or nil
+    if hit and deps_fresh(hit.deps, shared) then
+      -- deps_fresh already synced shared.lookups, keeping the pass budget
+      -- in lockstep with what a cold pass would have consumed here.
+      M._memo_stats.hits = M._memo_stats.hits + 1
+      restore_proc(proc, hit, shared)
+    else
+      M._memo_stats.misses = M._memo_stats.misses + 1
+      local ctx = setmetatable({ proc = proc, deps = {} }, { __index = shared })
+      analyze_proc(ctx)
+      shared.lookups = ctx.lookups or shared.lookups
+      if key then
+        proc_cache:put(key, snapshot_proc(ctx))
+      end
+    end
     for _, d in ipairs(proc.diagnostics) do
       result.diagnostics[#result.diagnostics + 1] = d
     end
-    shared.lookups = ctx.lookups or shared.lookups
   end
   -- Full tiebreak: table.sort is unstable, and same-line diagnostics would
   -- otherwise come back in nondeterministic order across runs.
@@ -1639,6 +2133,9 @@ function M.analyze_lines(lines, path)
 end
 
 -- Buffer wrapper around analyze_lines.
+---@param bufnr integer? defaults to the current buffer
+---@return masm.StackResult? result
+---@return string? reason
 function M.analyze(bufnr)
   bufnr = bufnr or 0
   local path = vim.api.nvim_buf_get_name(bufnr)
@@ -1656,6 +2153,9 @@ end
 -- Compresses a state back to `[name, pad(N), ...]` notation. Word and span
 -- groups whose cells sit adjacent and complete re-collapse to their group
 -- name; runs of zero-fill collapse to pad(N); anonymous runs to unknown(N).
+---@param state masm.StackState
+---@param max_items integer? rendered element cap (default 12)
+---@return string
 function M.render_cells(state, max_items)
   max_items = max_items or 12
   if state.bottom then

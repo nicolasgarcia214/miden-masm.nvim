@@ -4,22 +4,13 @@
 --   nvim --headless --clean -l tests/dap_test.lua
 -- or `make test`.
 
-local script = debug.getinfo(1, "S").source:sub(2)
-local here = vim.fs.dirname(vim.fn.fnamemodify(script, ":p"))
-vim.opt.rtp:prepend(vim.fs.dirname(here))
+local helpers = dofile(
+  vim.fs.dirname(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p")) .. "/helpers.lua"
+)
+local check = helpers.check
 
 local dap = require("masm.dap")
 local uv = vim.uv or vim.loop
-
-local failed = 0
-local function check(desc, ok, detail)
-  if ok then
-    print("PASS: " .. desc)
-  else
-    print("FAIL: " .. desc .. (detail and (" -- " .. detail) or ""))
-    failed = failed + 1
-  end
-end
 
 ---------------------------------------------------------------------------
 -- _build_launch
@@ -69,10 +60,12 @@ local port = dap._free_port("127.0.0.1", 0)
 check("port: allocates a free port", type(port) == "number" and port > 0, tostring(port))
 
 -- Occupy a port; asking for it must fall back to a different free one.
-local blocker = uv.new_tcp()
+-- assert()s: handle allocation only fails on fd exhaustion, which should
+-- kill the suite loudly, and the narrowing keeps the type checker honest.
+local blocker = assert(uv.new_tcp())
 blocker:bind("127.0.0.1", 0)
 blocker:listen(1, function() end)
-local taken = blocker:getsockname().port
+local taken = assert(blocker:getsockname()).port
 local fallback = dap._free_port("127.0.0.1", taken)
 blocker:close()
 check(
@@ -109,10 +102,10 @@ dap._kill()
 res = wait_result({
   cmd = "sh",
   args = { "-c", 'echo "DAP server listening"; sleep 0.3; echo post-ready-output; sleep 5' },
-})
+}, nil, 1000)
 check("adapter: ready before post-ready output", res == "ready", tostring(res))
 local drained = vim.wait(3000, function()
-  return table.concat(dap._last_output):find("post-ready-output", 1, true) ~= nil
+  return table.concat(dap._output(1000) or {}):find("post-ready-output", 1, true) ~= nil
 end, 50)
 check("adapter: pipes drained after readiness", drained)
 dap._kill()
@@ -129,6 +122,59 @@ check(
 )
 dap._kill()
 check("adapter: kill-all clears the table", next(dap._children) == nil)
+
+-- Quitting Neovim without nvim-dap's terminated/exited/disconnect events
+-- must not orphan backends: the first spawn registers a VimLeavePre hook
+-- that kills them all. Fired here via doautocmd (headless nvim -l never
+-- leaves through VimLeavePre itself).
+check(
+  "adapter: exit hook registered once a child spawned",
+  #vim.api.nvim_get_autocmds({ group = "masm_dap_exit", event = "VimLeavePre" }) == 1
+)
+check("adapter: exit-hook backend ready", wait_result(ready_spec, nil, 1003) == "ready")
+vim.api.nvim_exec_autocmds("VimLeavePre", {})
+check("adapter: exit hook kills every child", next(dap._children) == nil)
+
+-- Concurrent captured output: diagnostics are keyed per backend like the
+-- children table -- a shared buffer let the second launch wipe the first
+-- session's captured output (the evidence for a failed launch) and both
+-- backends interleave writes into it.
+res = wait_result({
+  cmd = "sh",
+  args = { "-c", 'echo "DAP server listening"; echo output-of-alpha; sleep 5' },
+}, nil, 2001)
+check("output: first keyed backend ready", res == "ready", tostring(res))
+res = wait_result({
+  cmd = "sh",
+  args = { "-c", 'echo "DAP server listening"; echo output-of-beta; sleep 5' },
+}, nil, 2002)
+check("output: second keyed backend ready", res == "ready", tostring(res))
+local both_captured = vim.wait(3000, function()
+  return table.concat(dap._output(2001) or {}):find("output-of-alpha", 1, true) ~= nil
+    and table.concat(dap._output(2002) or {}):find("output-of-beta", 1, true) ~= nil
+end, 50)
+local alpha = table.concat(dap._output(2001) or {})
+local beta = table.concat(dap._output(2002) or {})
+check("output: each session captures its own backend", both_captured, alpha .. " / " .. beta)
+check(
+  "output: second launch does not clear the first",
+  alpha:find("DAP server listening", 1, true) ~= nil
+    and alpha:find("output-of-alpha", 1, true) ~= nil,
+  alpha
+)
+check(
+  "output: no cross-session interleaving",
+  alpha:find("output-of-beta", 1, true) == nil and beta:find("output-of-alpha", 1, true) == nil,
+  alpha .. " / " .. beta
+)
+-- The companion property (already fixed): ending one session kills only
+-- its own child.
+dap._kill(2001)
+check(
+  "output: killing one session's child spares the other",
+  dap._children[2001] == nil and dap._children[2002] ~= nil
+)
+dap._kill()
 
 res = wait_result({ cmd = "sh", args = { "-c", "echo nope; exit 3" } })
 check(
@@ -172,6 +218,8 @@ local stub = {
     }),
   },
 }
+-- Redefining a loader the runtime defs already type is the point of a stub.
+---@diagnostic disable-next-line: duplicate-set-field
 package.preload["dap"] = function()
   return stub
 end
@@ -230,7 +278,4 @@ check("render: operand stack entries", text:find("[ 0] 7", 1, true) ~= nil, text
 check("render: frame with location", text:find("increment  script.masm:21", 1, true) ~= nil, text)
 check("render: frame without location survives", text:find("main", 1, true) ~= nil)
 
-print(failed == 0 and "ALL PASS" or (failed .. " FAILURES"))
-if failed > 0 then
-  os.exit(1)
-end
+helpers.finish()

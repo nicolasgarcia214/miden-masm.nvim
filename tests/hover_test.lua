@@ -3,37 +3,15 @@
 --   nvim --headless --clean -l tests/hover_test.lua
 -- or `make test`.
 
-local script = debug.getinfo(1, "S").source:sub(2)
-local here = vim.fs.dirname(vim.fn.fnamemodify(script, ":p"))
-local plugin_root = vim.fs.dirname(here)
-vim.opt.rtp:prepend(plugin_root)
+local helpers = dofile(
+  vim.fs.dirname(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p")) .. "/helpers.lua"
+)
+local here = helpers.here
+local check = helpers.check
 
 local hover = require("masm.hover")
 local root = here .. "/fixtures/"
-
-local failed = 0
-
-local function check(desc, ok, detail)
-  if ok then
-    print("PASS: " .. desc)
-  else
-    print("FAIL: " .. desc .. (detail and (" -- " .. detail) or ""))
-    failed = failed + 1
-  end
-end
-
-local function place(file, find, off)
-  vim.cmd("edit! " .. root .. file)
-  local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
-  for i, l in ipairs(lines) do
-    local s = l:find(find, 1, true)
-    if s then
-      vim.api.nvim_win_set_cursor(0, { i, s - 1 + (off or 0) })
-      return true
-    end
-  end
-  error("locator not found: " .. find .. " in " .. file)
-end
+local place = helpers.placer(root)
 
 local function has_line(res, frag)
   for _, l in ipairs(res and res.lines or {}) do
@@ -174,7 +152,4 @@ place("app/aliased.masm", "use fix::nowhere::gone", 19)
 local nores, reason = hover.content()
 check("unresolvable: no content, reason given", nores == nil and type(reason) == "string", reason)
 
-print(failed == 0 and "ALL PASS" or (failed .. " FAILURES"))
-if failed > 0 then
-  os.exit(1)
-end
+helpers.finish()

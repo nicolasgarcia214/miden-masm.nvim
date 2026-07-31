@@ -30,6 +30,14 @@
 
 local M = {}
 
+---@class masm.ArityEntry stack effect of one mnemonic (see the header)
+---@field bare {[1]: integer, [2]: integer|'"n"'}? {pops, pushes} without an
+---   immediate; "n" pushes take the count from the immediate
+---@field imm {[1]: integer, [2]: integer|'"n"'}? {pops, pushes} with one
+---@field expr string? pushed-result name template ({a} = top popped operand,
+---   {b} = second)
+
+---@type table<string, masm.ArityEntry>
 M.ops = {
   -- Field arithmetic ------------------------------------------------------
   add = { bare = { 2, 1 }, imm = { 1, 1 }, expr = "{b} + {a}" },
@@ -161,8 +169,11 @@ M.ops = {
   mtree_set = { bare = { 10, 8 } }, -- [d, i, R, V'] -> [V, R']
   mtree_merge = { bare = { 8, 4 } },
   mtree_verify = { bare = { 10, 10 } }, -- [V, d, i, R] left intact
-  -- No-ops / decorators (dotted suffixes are subcommands, not immediates;
-  -- masm.stack routes `debug.*`, `trace.*`, `emit.*` and `adv.*` here) -----
+  -- No-ops / decorators. `debug.*`, `trace.*` and `adv.*` are intercepted
+  -- by masm.stack (their dotted suffixes are subcommands, not immediates,
+  -- and have no entries here); `emit` is table-driven on purpose -- this
+  -- entry is its single source of truth for both the bare and the
+  -- `.event_id` form (masm.stack deliberately does not intercept it) ------
   nop = { bare = { 0, 0 } },
   breakpoint = { bare = { 0, 0 } },
   emit = { bare = { 0, 0 }, imm = { 0, 0 } },
@@ -171,6 +182,7 @@ M.ops = {
 -- Positional/copy ops the simulator implements cell-by-cell. `swap`, `dup`
 -- and `dupw` accept an optional index immediate; the rest of the indexed
 -- ones require it. All are net 0 except dup/dupw (+1/+4).
+---@type table<string, true>
 M.special = {
   swap = true,
   swapw = true,

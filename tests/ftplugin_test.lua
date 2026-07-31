@@ -4,32 +4,23 @@
 -- switching filetype away.
 -- Run with: nvim --headless --clean -l tests/ftplugin_test.lua (or make test)
 
-local script = debug.getinfo(1, "S").source:sub(2)
-local here = vim.fs.dirname(vim.fn.fnamemodify(script, ":p"))
-local plugin_root = vim.fs.dirname(here)
-vim.opt.rtp:prepend(plugin_root)
-vim.opt.rtp:append(plugin_root .. "/after")
+local helpers = dofile(
+  vim.fs.dirname(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p")) .. "/helpers.lua"
+)
+local here = helpers.here
+local check = helpers.check
+vim.opt.rtp:append(helpers.plugin_root .. "/after")
 -- The rtp edit above happens after startup, so plugin/ was not sourced the
 -- way a plugin manager would; source it explicitly. This is also what puts
 -- the plugin's own `*.masm` filetype registration under test -- Neovim 0.10
 -- has no built-in mapping and would otherwise detect `conf`.
 vim.cmd("runtime! plugin/miden-masm.lua")
 
-local failed = 0
 -- Neovim 0.11+ ships GLOBAL default grr/gO (LSP) mappings, so presence must
 -- be asserted on the buffer-local mapping specifically.
 local function buf_mapped(lhs)
   local m = vim.fn.maparg(lhs, "n", false, true)
   return m.buffer == 1
-end
-
-local function check(desc, ok, detail)
-  if ok then
-    print("PASS: " .. desc)
-  else
-    print("FAIL: " .. desc .. (detail and (" -- " .. detail) or ""))
-    failed = failed + 1
-  end
 end
 
 vim.cmd("filetype plugin on")
@@ -96,7 +87,4 @@ check("opt-out: no stack autocmds", not no_stack_autocmds)
 vim.g.masm_no_default_mappings = nil
 vim.g.masm_no_stack = nil
 
-print(failed == 0 and "ALL PASS" or (failed .. " FAILURES"))
-if failed > 0 then
-  os.exit(1)
-end
+helpers.finish()

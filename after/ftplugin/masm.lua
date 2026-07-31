@@ -90,6 +90,13 @@ vim.api.nvim_buf_create_user_command(0, "MasmRebuildIndex", function()
   vim.notify("masm goto: index cleared; it rebuilds on the next jump")
 end, { desc = "Rebuild the MASM go-to-definition project index" })
 
+-- Debugger (lua/masm/dap.lua): registers the `miden` adapter and default
+-- launch/attach configurations with nvim-dap when it is installed; inert
+-- otherwise. `vim.g.masm_no_dap = true` opts out entirely.
+if not vim.g.masm_no_dap then
+  require("masm.dap").register()
+end
+
 -- Stack analysis (lua/masm/stack.lua + stackview.lua): publishes depth/ABI
 -- diagnostics and offers an inferred-stack eol overlay via :MasmStackToggle.
 -- `vim.g.masm_no_stack = true` wires nothing at all -- the zero-cost opt-out,

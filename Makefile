@@ -9,6 +9,7 @@ test:
 	nvim --headless --clean -l tests/hover_test.lua
 	nvim --headless --clean -l tests/stack_test.lua
 	nvim --headless --clean -l tests/complete_test.lua
+	nvim --headless --clean -l tests/dap_test.lua
 	nvim --headless --clean -l tests/ftplugin_test.lua
 
 test-queries: $(PARSER_BUILD)/parser/masm.so

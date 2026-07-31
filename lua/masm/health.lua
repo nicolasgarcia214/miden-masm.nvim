@@ -35,6 +35,35 @@ function M.check()
     health.error("stack analyzer failed to load")
   end
 
+  if pcall(require, "masm.complete") then
+    health.ok("completion module loads (<C-x><C-o> via 'omnifunc')")
+  else
+    health.error("require('masm.complete') failed")
+  end
+
+  -- Debugger integration is optional at every level: the module must load,
+  -- but missing nvim-dap or backends only mean the feature stays off.
+  local dap_ok, masm_dap = pcall(require, "masm.dap")
+  if not dap_ok then
+    health.error("require('masm.dap') failed")
+  elseif vim.g.masm_no_dap then
+    health.info("debugger integration disabled (vim.g.masm_no_dap is set)")
+  else
+    local registered, why = masm_dap.register()
+    if registered then
+      health.ok("miden debug adapter registered with nvim-dap (:DapNew, :MasmDapState)")
+    else
+      health.info("debugger integration off: " .. why)
+    end
+    for _, bin in ipairs({ "miden-debug", "miden-client" }) do
+      if vim.fn.executable(bin) == 1 then
+        health.ok(bin .. " found on PATH")
+      else
+        health.info(bin .. " not on PATH (needed only to launch that debug backend)")
+      end
+    end
+  end
+
   if pcall(require, "nvim-treesitter") then
     health.ok("nvim-treesitter is installed")
   else

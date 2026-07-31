@@ -70,6 +70,9 @@ if not vim.g.masm_no_default_mappings then
   vim.keymap.set("n", "grr", function()
     require("masm.goto").references()
   end, { buffer = true, desc = "MASM references" })
+  vim.keymap.set("n", "grn", function()
+    require("masm.goto").rename()
+  end, { buffer = true, desc = "MASM rename" })
   vim.keymap.set("n", "gO", function()
     require("masm.goto").document_symbols()
   end, { buffer = true, desc = "MASM document symbols" })
@@ -78,6 +81,9 @@ if not vim.g.masm_no_default_mappings then
     require("masm.hover").hover()
   end, { buffer = true, desc = "MASM hover" })
 end
+vim.api.nvim_buf_create_user_command(0, "MasmRename", function(cmd)
+  require("masm.goto").rename(cmd.args ~= "" and cmd.args or nil)
+end, { nargs = "?", desc = "Rename the MASM symbol under the cursor project-wide" })
 vim.api.nvim_buf_create_user_command(0, "MasmRebuildIndex", function()
   require("masm.goto").clear_cache()
   require("masm.stack").clear_cache()
@@ -112,8 +118,10 @@ local undo = "setl commentstring< comments< iskeyword< tagfunc< omnifunc<"
   .. " | unlet! b:match_words b:match_ignorecase"
   .. " | exe 'silent! nunmap <buffer> gd'"
   .. " | exe 'silent! nunmap <buffer> grr'"
+  .. " | exe 'silent! nunmap <buffer> grn'"
   .. " | exe 'silent! nunmap <buffer> gO'"
   .. " | exe 'silent! nunmap <buffer> K'"
+  .. " | silent! delcommand -buffer MasmRename"
   .. " | silent! delcommand -buffer MasmRebuildIndex"
   .. " | silent! call v:lua.require'masm.stackview'.detach()"
   .. " | silent! delcommand -buffer MasmStackToggle"

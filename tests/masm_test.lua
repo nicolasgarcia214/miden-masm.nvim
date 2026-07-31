@@ -261,7 +261,7 @@ end
 
 -- Const references, including through renames in both directions.
 place("app/main.masm", "push.MAX_VALUE", 5)
-local refs = goto_mod.references() or {}
+local refs = goto_mod.references({ sync = true }) or {}
 close_lists()
 check(
   "refs: definition listed first",
@@ -290,7 +290,7 @@ check(
 
 -- Proc references: bare calls through `pub use` imports count.
 place("app/main.masm", "exec.math::add_checked", 12)
-refs = goto_mod.references() or {}
+refs = goto_mod.references({ sync = true }) or {}
 close_lists()
 check(
   "refs: proc def first",
@@ -308,7 +308,7 @@ check(
 -- in aliased.masm, two pub-use re-exports in wrappers.masm, one in
 -- stack.masm (the stack-analyzer fixture).
 place("app/main.masm", "exec.math::add_checked", 6)
-refs = goto_mod.references() or {}
+refs = goto_mod.references({ sync = true }) or {}
 close_lists()
 check("refs: exactly the seven use-sites found", #refs == 7, "got " .. #refs)
 local all_use = #refs > 0
@@ -402,6 +402,116 @@ for _, s in ipairs(syms) do
   end
 end
 check("symbols: begin_impostor is not an entrypoint", not impostor)
+
+-- ------------------------------------------------------------------------
+-- Async references: same results as sync, delivered via the event loop
+-- ------------------------------------------------------------------------
+
+place("app/main.masm", "push.MAX_VALUE", 5)
+local sync_refs = goto_mod.references({ sync = true }) or {}
+close_lists()
+vim.fn.setqflist({}, " ", { title = "sentinel", items = {} })
+place("app/main.masm", "push.MAX_VALUE", 5)
+local async_ret = goto_mod.references()
+check("async refs: no immediate return", async_ret == nil)
+local done = vim.wait(5000, function()
+  return vim.fn.getqflist({ title = 1 }).title ~= "sentinel"
+end, 10)
+close_lists()
+local async_list = vim.fn.getqflist()
+check("async refs: quickfix populated from the event loop", done and #async_list > 0)
+check(
+  "async refs: same result count as sync",
+  #async_list == #sync_refs,
+  ("async %d vs sync %d"):format(#async_list, #sync_refs)
+)
+
+-- ------------------------------------------------------------------------
+-- Rename: definition, spelled references and import-item originals change;
+-- alias spellings survive
+-- ------------------------------------------------------------------------
+
+local function buffer_text_of(rel)
+  local bufnr = vim.fn.bufadd(root .. rel)
+  vim.fn.bufload(bufnr)
+  return table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
+end
+
+place("app/main.masm", "push.MAX_VALUE", 5)
+local res, why = goto_mod.rename("RENAMED_MAX")
+check("rename: succeeds", res ~= nil, tostring(why))
+check(
+  "rename: 6 occurrences in 4 files",
+  res ~= nil and res.applied == 6 and res.files == 4 and res.skipped == 0,
+  res ~= nil and vim.inspect(res) or "no result"
+)
+local math_text = buffer_text_of("core_lib/math.masm")
+check("rename: definition renamed", math_text:find("pub const RENAMED_MAX", 1, true) ~= nil)
+check("rename: def-file usage renamed", math_text:find("push.RENAMED_MAX", 1, true) ~= nil)
+check(
+  "rename: comment mentions untouched",
+  math_text:find("Mentions of MAX_VALUE in comments", 1, true) ~= nil
+)
+check(
+  "rename: string-literal mentions untouched",
+  math_text:find("sum exceeded MAX_VALUE", 1, true) ~= nil
+)
+local main_text = buffer_text_of("app/main.masm")
+check("rename: selective import renamed", main_text:find("{RENAMED_MAX}", 1, true) ~= nil)
+check("rename: plain usage renamed", main_text:find("push.RENAMED_MAX", 1, true) ~= nil)
+local aliased_text = buffer_text_of("app/aliased.masm")
+check(
+  "rename: import original renamed, alias kept",
+  aliased_text:find("{RENAMED_MAX as ALIASED_MAX}", 1, true) ~= nil
+)
+check("rename: alias usage untouched", aliased_text:find("push.ALIASED_MAX", 1, true) ~= nil)
+local wrappers_text = buffer_text_of("std_lib/wrappers.masm")
+check(
+  "rename: re-export original renamed, rename kept",
+  wrappers_text:find("{RENAMED_MAX as LIMIT}", 1, true) ~= nil
+)
+check(
+  "rename: aliased re-export usage untouched",
+  main_text:find("wrappers::LIMIT", 1, true) ~= nil
+)
+
+-- Buffers were left modified, not written: fixtures on disk are untouched.
+local disk_math = io.open(root .. "core_lib/math.masm", "r"):read("*a")
+check("rename: nothing written to disk", disk_math:find("MAX_VALUE", 1, true) ~= nil)
+
+-- Renamed-state navigation still works (buffers are the source of truth),
+-- then discard every unsaved buffer so later suites see the fixtures.
+place("app/main.masm", "push.RENAMED_MAX", 5)
+local renamed_jump = goto_mod.tagfunc("", "c", {})
+check(
+  "rename: navigation follows the new name",
+  renamed_jump ~= vim.NIL
+    and renamed_jump[1] ~= nil
+    and renamed_jump[1].filename:find("core_lib/math.masm", 1, true) ~= nil
+)
+for _, b in ipairs(vim.api.nvim_list_bufs()) do
+  if vim.api.nvim_buf_is_loaded(b) and vim.bo[b].modified then
+    vim.api.nvim_buf_call(b, function()
+      vim.cmd("edit!")
+    end)
+  end
+end
+check(
+  "rename: fixtures restored for later suites",
+  buffer_text_of("core_lib/math.masm"):find("pub const MAX_VALUE", 1, true) ~= nil
+)
+
+-- Guard rails: modules and invalid names are refused.
+place("app/main.masm", "exec.math::add_checked", 6)
+local mod_res, mod_why = goto_mod.rename("whatever")
+check("rename: refuses modules", mod_res == nil and mod_why == "not a symbol", tostring(mod_why))
+place("app/main.masm", "push.MAX_VALUE", 5)
+local bad_res, bad_why = goto_mod.rename("123bad")
+check(
+  "rename: refuses invalid names",
+  bad_res == nil and bad_why == "invalid name",
+  tostring(bad_why)
+)
 
 -- ------------------------------------------------------------------------
 -- Dialect-drift canary: unrecognized use-statement forms are reported

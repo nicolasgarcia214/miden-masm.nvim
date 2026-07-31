@@ -984,6 +984,10 @@ end
 -- Collects every usage in `text` (one file) that resolves to the definition
 -- at (def_path, def_lnum) whose definition-site name is `def_name`. Renamed
 -- re-exports are handled by resolving each candidate, not by name matching.
+-- `add` receives (file, lnum, col, raw_line, spelled_name, name_col):
+-- `spelled_name` is the last path segment actually written at the site and
+-- `name_col` its 1-based column -- rename() needs both to rewrite exactly
+-- the sites that spell the definition name, leaving aliases alone.
 local function collect_symbol_refs(f, text, def_path, def_lnum, def_name, index, add)
   local mods, syms = parse_imports(text)
   -- Local names in this file that resolve to the definition.
@@ -1014,19 +1018,20 @@ local function collect_symbol_refs(f, text, def_path, def_lnum, def_name, index,
           if mf then
             local p, l = find_symbol(mf, segs[#segs], index, 0)
             if p == def_path and l == def_lnum then
-              add(f, lnum, s, raw)
+              local name = segs[#segs]
+              add(f, lnum, s, raw, name, s + #tok - #name)
             end
           end
         end
       elseif local_names[tok] then
-        add(f, lnum, s, raw)
+        add(f, lnum, s, raw, tok, s)
       elseif line:sub(1, s - 1):match("([%w_]+)%.$") == "syscall" then
         -- `syscall.name` needs no import; resolve against the kernel library.
         for _, lib in ipairs(index.libs) do
           if lib.kernel then
             local p, l = find_symbol(lib.root_file, tok, index, 0)
             if p == def_path and l == def_lnum then
-              add(f, lnum, s, raw)
+              add(f, lnum, s, raw, tok, s)
             end
           end
         end
@@ -1071,87 +1076,98 @@ local function collect_module_refs(f, text, def_path, index, add)
   end
 end
 
--- Finds all references to the symbol (or module) under the cursor across the
--- indexed project and populates the quickfix list. The definition comes first.
-function M.references()
-  local bufpath = vim.api.nvim_buf_get_name(0)
-  if bufpath == "" then
-    return
-  end
-  local cfg = get_config()
-  local ok, index = pcall(build_index, bufpath, cfg)
-  if not ok then
-    vim.notify("masm references: indexing failed: " .. tostring(index), vim.log.levels.ERROR)
-    return
-  end
-  local buftext = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "\n")
-
+-- Resolves the cursor to a scan target: the ground-truth definition plus
+-- what a project scan needs to recognize it. Returns
+-- { is_symbol, def_path, def_lnum, def_name, kw } or nil and a reason.
+local function reference_target(index, buftext, bufpath)
   local res_ok, item, reason = pcall(resolve_at_cursor, index, buftext, bufpath)
   if not res_ok then
-    vim.notify("masm references: " .. tostring(item), vim.log.levels.ERROR)
-    return
+    return nil, tostring(item)
   end
   if not item then
-    vim.notify("masm references: " .. (reason or "cannot resolve"), vim.log.levels.WARN)
-    return
+    return nil, reason or "cannot resolve"
   end
-  local def_path, def_lnum = item.filename, tonumber(item.cmd)
-
-  -- The resolver tags what it found (module file vs symbol) in user_data.
-  -- For symbols, read the definition line for its keyword and definition-site
-  -- name (which may differ from the cursor's name across renamed imports).
-  local is_symbol = item.user_data ~= "module"
-  local kw, def_name
-  if is_symbol then
+  local target = {
+    is_symbol = item.user_data ~= "module",
+    def_path = item.filename,
+    def_lnum = tonumber(item.cmd),
+  }
+  if target.is_symbol then
     -- def_lnum was resolved against the current buffer's (possibly unsaved)
     -- text when the definition lives here; the def line must come from the
     -- same source, or unsaved edits above it would silently make the scan
     -- describe whatever symbol sits on that disk line instead.
-    local def_text = (def_path == bufpath and buftext) or read_file(def_path) or ""
-    local def_line = vim.split(def_text, "\n")[def_lnum] or ""
-    kw, def_name = strip_pub(def_line):match("^(%a+)%s+([%w_]+)")
-    if not def_name then
-      vim.notify(
-        "masm references: no definition at " .. def_path .. ":" .. def_lnum,
-        vim.log.levels.WARN
-      )
+    local def_text = (target.def_path == bufpath and buftext) or read_file(target.def_path) or ""
+    local def_line = vim.split(def_text, "\n")[target.def_lnum] or ""
+    target.kw, target.def_name = strip_pub(def_line):match("^(%a+)%s+([%w_]+)")
+    if not target.def_name then
+      return nil, "no definition at " .. target.def_path .. ":" .. target.def_lnum
+    end
+  end
+  return target
+end
+
+-- Text for a scanned file: the live buffer when one is loaded (unsaved
+-- edits must win everywhere -- for rename they MUST, or collected positions
+-- would not match the buffer the edit lands in), disk otherwise.
+local function file_text(f)
+  local bufnr = vim.fn.bufnr(f)
+  if bufnr ~= -1 and vim.api.nvim_buf_is_loaded(bufnr) then
+    return table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
+  end
+  return read_file(f)
+end
+
+-- Cooperative scan driver. A references() scan visits every indexed file;
+-- on a large project (or a miden-vm extra_root) that is hundreds of files,
+-- and doing it in one go would freeze the UI thread for its duration.
+-- Instead the scan runs in time slices and yields to the event loop between
+-- them; `sync = true` (tests, rename) runs to completion in one call.
+-- Starting a new scan cancels the one in flight.
+local active_scan
+local SCAN_SLICE_MS = 10
+
+local function run_scan(scan)
+  local deadline = scan.sync and math.huge or (uv.hrtime() + SCAN_SLICE_MS * 1e6)
+  while scan.i <= #scan.files do
+    if uv.hrtime() > deadline then
+      vim.schedule(function()
+        if not scan.cancelled then
+          run_scan(scan)
+        end
+      end)
       return
     end
-  end
-
-  local items, seen = {}, {}
-  local function add(f, lnum, col, text)
-    local key = f .. ":" .. lnum .. ":" .. col
-    if not seen[key] then
-      seen[key] = true
-      table.insert(items, { filename = f, lnum = lnum, col = col, text = vim.trim(text) })
-    end
-  end
-
-  -- One unreadable or pathological file must not kill the whole scan.
-  local scan_errors = 0
-  for _, f in ipairs(index.masm) do
-    -- Unsaved edits in the current buffer take precedence over disk.
-    local text = f == bufpath and buftext or read_file(f)
+    local f = scan.files[scan.i]
+    scan.i = scan.i + 1
+    local text = file_text(f)
     if text then
-      local ok
-      if is_symbol then
-        ok = pcall(collect_symbol_refs, f, text, def_path, def_lnum, def_name, index, add)
-      else
-        ok = pcall(collect_module_refs, f, text, def_path, index, add)
-      end
-      if not ok then
-        scan_errors = scan_errors + 1
+      -- One unreadable or pathological file must not kill the whole scan.
+      if not pcall(scan.visit, f, text) then
+        scan.errors = scan.errors + 1
       end
     end
   end
-  if scan_errors > 0 then
-    vim.notify("masm references: failed to scan " .. scan_errors .. " file(s)", vim.log.levels.WARN)
+  if scan == active_scan then
+    active_scan = nil
   end
+  scan.on_done()
+end
 
+local function start_scan(scan)
+  if active_scan then
+    active_scan.cancelled = true
+  end
+  active_scan = not scan.sync and scan or active_scan
+  scan.i = 1
+  scan.errors = 0
+  run_scan(scan)
+end
+
+local function sort_ref_items(items, target)
   table.sort(items, function(a, b)
-    local a_def = a.filename == def_path and a.lnum == def_lnum
-    local b_def = b.filename == def_path and b.lnum == def_lnum
+    local a_def = a.filename == target.def_path and a.lnum == target.def_lnum
+    local b_def = b.filename == target.def_path and b.lnum == target.def_lnum
     if a_def ~= b_def then
       return a_def -- the definition sorts first
     end
@@ -1163,15 +1179,245 @@ function M.references()
     end
     return a.col < b.col
   end)
+end
 
-  if #items == 0 then
-    vim.notify("masm references: no references found", vim.log.levels.WARN)
+-- Finds all references to the symbol (or module) under the cursor across the
+-- indexed project and populates the quickfix list, definition first. The
+-- scan is asynchronous (the quickfix list opens when it completes); pass
+-- { sync = true } to block until done and get the items back.
+function M.references(opts)
+  opts = opts or {}
+  local bufpath = vim.api.nvim_buf_get_name(0)
+  if bufpath == "" then
     return
   end
-  local what = is_symbol and (kw .. " " .. def_name) or ("module " .. vim.fs.basename(def_path))
-  vim.fn.setqflist({}, " ", { title = "MASM references: " .. what, items = items })
-  vim.cmd("botright copen")
-  return items
+  local ok, index = pcall(build_index, bufpath, get_config())
+  if not ok then
+    vim.notify("masm references: indexing failed: " .. tostring(index), vim.log.levels.ERROR)
+    return
+  end
+  local buftext = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "\n")
+  local target, reason = reference_target(index, buftext, bufpath)
+  if not target then
+    vim.notify("masm references: " .. reason, vim.log.levels.WARN)
+    return
+  end
+
+  local items, seen = {}, {}
+  local function add(f, lnum, col, text)
+    local key = f .. ":" .. lnum .. ":" .. col
+    if not seen[key] then
+      seen[key] = true
+      table.insert(items, { filename = f, lnum = lnum, col = col, text = vim.trim(text) })
+    end
+  end
+
+  local scan
+  scan = {
+    files = index.masm,
+    sync = opts.sync,
+    visit = function(f, text)
+      if target.is_symbol then
+        collect_symbol_refs(f, text, target.def_path, target.def_lnum, target.def_name, index, add)
+      else
+        collect_module_refs(f, text, target.def_path, index, add)
+      end
+    end,
+    on_done = function()
+      if scan.errors > 0 then
+        vim.notify(
+          "masm references: failed to scan " .. scan.errors .. " file(s)",
+          vim.log.levels.WARN
+        )
+      end
+      sort_ref_items(items, target)
+      if #items == 0 then
+        vim.notify("masm references: no references found", vim.log.levels.WARN)
+        return
+      end
+      local what = target.is_symbol and (target.kw .. " " .. target.def_name)
+        or ("module " .. vim.fs.basename(target.def_path))
+      vim.fn.setqflist({}, " ", { title = "MASM references: " .. what, items = items })
+      vim.cmd("botright copen")
+    end,
+  }
+  start_scan(scan)
+  if opts.sync then
+    return #items > 0 and items or nil
+  end
+end
+
+---------------------------------------------------------------------------
+-- Rename
+---------------------------------------------------------------------------
+
+-- Occurrences of `target.def_name` as the ORIGINAL side of `use { orig }` /
+-- `use { orig as alias }` items whose chain resolves to the definition.
+-- These are not references (the local name at the use sites is the alias)
+-- but rename must rewrite them, or the import would break: renaming
+-- MAX_VALUE leaves `use { MAX_VALUE as LIMIT }` pointing at nothing.
+local function collect_import_item_edits(f, text, target, index, add)
+  local code = code_text(text)
+  local cur_line, cur_off = 1, 1
+  local function line_of(off)
+    while true do
+      local nl = code:find("\n", cur_off, true)
+      if not nl or nl >= off then
+        return cur_line, cur_off
+      end
+      cur_line = cur_line + 1
+      cur_off = nl + 1
+    end
+  end
+  each_selective_use(code, false, function(stmt)
+    local mf = resolve_module_cached(split_path(stmt.mod), index)
+    if not mf then
+      return
+    end
+    for item_pos, item in stmt.braces:gmatch("()([^,]+)") do
+      local name_off, orig = item:match("()([%w_]+)")
+      if orig == target.def_name then
+        local p, l = find_symbol(mf, orig, index, 0)
+        if p == target.def_path and l == target.def_lnum then
+          -- brace content index j sits at code index stmt.brace_open + j
+          -- (brace_open is the `{` itself).
+          local abs = stmt.brace_open + item_pos + name_off - 1
+          local lnum, line_start = line_of(abs)
+          add(f, lnum, abs - line_start + 1)
+        end
+      end
+    end
+  end)
+end
+
+local function valid_ident(name)
+  return type(name) == "string" and name:match("^[%a_][%w_]*$") ~= nil
+end
+
+-- Renames the symbol under the cursor across the project: the definition,
+-- every reference that spells the definition-site name (sites using an `as`
+-- alias keep their alias -- that is the correct semantics, the alias still
+-- resolves) and the original side of importing/re-exporting use-items.
+-- Edits are applied to buffers and left unsaved for review (`:wa` writes
+-- them); each buffer's undo history covers its own edits. Synchronous by
+-- design: a scan racing user edits could write the new name into positions
+-- that no longer hold the old one, and the applied-edit verification below
+-- would then skip them.
+function M.rename(new_name)
+  local bufpath = vim.api.nvim_buf_get_name(0)
+  if bufpath == "" then
+    return nil, "unnamed buffer"
+  end
+  local ok, index = pcall(build_index, bufpath, get_config())
+  if not ok then
+    return nil, "indexing failed: " .. tostring(index)
+  end
+  local buftext = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "\n")
+  local target, reason = reference_target(index, buftext, bufpath)
+  if not target then
+    vim.notify("masm rename: " .. reason, vim.log.levels.WARN)
+    return nil, reason
+  end
+  if not target.is_symbol then
+    vim.notify("masm rename: renames procs/consts/types, not modules", vim.log.levels.WARN)
+    return nil, "not a symbol"
+  end
+
+  if new_name == nil then
+    vim.ui.input({ prompt = "Rename " .. target.def_name .. " to: " }, function(input)
+      if input and input ~= "" then
+        M.rename(input)
+      end
+    end)
+    return
+  end
+  if not valid_ident(new_name) then
+    vim.notify("masm rename: invalid name " .. vim.inspect(new_name), vim.log.levels.WARN)
+    return nil, "invalid name"
+  end
+  if new_name == target.def_name then
+    return nil, "same name"
+  end
+
+  -- Collect edit positions: (file, lnum, 1-based col of the old name).
+  local edits, seen = {}, {}
+  local function add(f, lnum, col)
+    local key = f .. ":" .. lnum .. ":" .. col
+    if not seen[key] then
+      seen[key] = true
+      edits[f] = edits[f] or {}
+      table.insert(edits[f], { lnum, col })
+    end
+  end
+  local scan
+  scan = {
+    files = index.masm,
+    sync = true,
+    visit = function(f, text)
+      collect_symbol_refs(
+        f,
+        text,
+        target.def_path,
+        target.def_lnum,
+        target.def_name,
+        index,
+        function(sf, lnum, _, _, name, name_col)
+          if name == target.def_name then
+            add(sf, lnum, name_col)
+          end
+        end
+      )
+      collect_import_item_edits(f, text, target, index, add)
+    end,
+    on_done = function() end,
+  }
+  start_scan(scan)
+  if scan.errors > 0 then
+    vim.notify(
+      "masm rename: aborted, failed to scan " .. scan.errors .. " file(s)",
+      vim.log.levels.ERROR
+    )
+    return nil, "scan failed"
+  end
+
+  -- Apply bottom-up so earlier edits cannot shift later positions, verifying
+  -- the old name is still at each position (it was collected from this exact
+  -- buffer/disk state, so a mismatch means a concurrent change: skip, count).
+  local old = target.def_name
+  local applied, skipped, file_count = 0, 0, 0
+  for f, spots in pairs(edits) do
+    table.sort(spots, function(a, b)
+      if a[1] ~= b[1] then
+        return a[1] > b[1]
+      end
+      return a[2] > b[2]
+    end)
+    local bufnr = vim.fn.bufadd(f)
+    vim.fn.bufload(bufnr)
+    file_count = file_count + 1
+    for _, s in ipairs(spots) do
+      local lnum, col = s[1], s[2]
+      local line = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)[1] or ""
+      if line:sub(col, col + #old - 1) == old then
+        vim.api.nvim_buf_set_text(bufnr, lnum - 1, col - 1, lnum - 1, col - 1 + #old, { new_name })
+        applied = applied + 1
+      else
+        skipped = skipped + 1
+      end
+    end
+  end
+
+  local msg = ("masm rename: %s -> %s, %d occurrence(s) in %d file(s); buffers left unsaved (:wa to write)"):format(
+    old,
+    new_name,
+    applied,
+    file_count
+  )
+  if skipped > 0 then
+    msg = msg .. ("; %d skipped (text changed)"):format(skipped)
+  end
+  vim.notify(msg, skipped > 0 and vim.log.levels.WARN or vim.log.levels.INFO)
+  return { applied = applied, skipped = skipped, files = file_count }
 end
 
 ---------------------------------------------------------------------------

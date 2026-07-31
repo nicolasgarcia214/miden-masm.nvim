@@ -452,6 +452,71 @@ check(
 )
 
 ---------------------------------------------------------------------------
+-- engine: order-aware comment checking (same multiset, different order)
+---------------------------------------------------------------------------
+
+-- Virtual file under the fixture app dir so the resolver has a project.
+local function analyze_virtual(lines)
+  return stack.analyze_lines(lines, here .. "/fixtures/app/virtual.masm")
+end
+
+local function reorder_proc(tracker)
+  return {
+    "#! Invocation: call",
+    "#! Inputs:  [b, a, pad(14)]",
+    "#! Outputs: [a, b, pad(14)]",
+    "proc reorder",
+    "    swap",
+    "    " .. tracker,
+    "end",
+  }
+end
+
+local vres = analyze_virtual(reorder_proc("# => [b, a, pad(14)]"))
+local reorder_diag
+for _, d in ipairs(vres and vres.diagnostics or {}) do
+  if d.code == "comment-reordered" then
+    reorder_diag = d
+  end
+end
+check("order: swapped comment flagged", reorder_diag ~= nil and reorder_diag.lnum == 6)
+check(
+  "order: message shows the simulated stack",
+  reorder_diag ~= nil and reorder_diag.message:find("[a, b, pad(14)]", 1, true) ~= nil,
+  reorder_diag and reorder_diag.message
+)
+check(
+  "order: wrong order not adopted, exit stays correct",
+  vres ~= nil and #vres.diagnostics == 1,
+  vres and tostring(#vres.diagnostics)
+)
+
+vres = analyze_virtual(reorder_proc("# => [a, b, pad(14)]"))
+check("order: correct comment silent", vres ~= nil and #vres.diagnostics == 0)
+
+-- Synonyms (different name multiset) stay exempt: adoption, no judgment.
+vres = analyze_virtual(reorder_proc("# => [x, y, pad(14)]"))
+check("order: renamed elements not flagged", vres ~= nil and #vres.diagnostics == 0)
+
+-- Anonymous cells (unknown callee outputs) can never trip the check.
+vres = analyze_virtual({
+  "#! Invocation: call",
+  "#! Inputs:  [b, a, pad(14)]",
+  "#! Outputs: [a, b, pad(14)]",
+  "proc reorder",
+  "    dyncall",
+  "    # => [b, a, pad(14)]",
+  "end",
+})
+local anon_flagged = false
+for _, d in ipairs(vres and vres.diagnostics or {}) do
+  if d.code == "comment-reordered" then
+    anon_flagged = true
+  end
+end
+check("order: anonymous cells exempt", not anon_flagged)
+
+---------------------------------------------------------------------------
 -- stackview: diagnostics publishing, config gates, overlay extmarks
 ---------------------------------------------------------------------------
 

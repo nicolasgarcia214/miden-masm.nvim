@@ -1044,6 +1044,54 @@ local function apply_tracker(state, parsed, ctx, lnum)
   for _, c in ipairs(cells) do
     c.origin = "comment"
   end
+  -- Order check: widths agree, so normally the comment's names are adopted
+  -- without judgment (they carry primes, rebindings and synonyms). The one
+  -- case that IS judged: the comment lists exactly the same named elements
+  -- as the simulation but in a different order. Same multiset + different
+  -- sequence cannot be a renaming -- it is a swapped-operands comment, the
+  -- width-blind bug class order-insensitive checking cannot see. Guarded to
+  -- floored mode (the physical stack is fully known there; relative-mode
+  -- comments legitimately mix declared-inputs and caller views) and to
+  -- fully-named states on both sides, so synonyms and anonymous cells can
+  -- never trip it. Compared by name only: word lanes are numbered in
+  -- opposite directions by push (top-first) and by notation expansion
+  -- (declaration order), so lane indices are presentation, not identity.
+  if state.mode == "floored" then
+    local counts, all_named, same_order = {}, true, true
+    for i = 1, sim_width do
+      local sk, ck = state.cells[i].name, cells[i].name
+      if not sk or not ck then
+        all_named = false
+        break
+      end
+      counts[sk] = (counts[sk] or 0) + 1
+      counts[ck] = (counts[ck] or 0) - 1
+      if sk ~= ck then
+        same_order = false
+      end
+    end
+    if all_named and not same_order then
+      local same_multiset = true
+      for _, n in pairs(counts) do
+        if n ~= 0 then
+          same_multiset = false
+          break
+        end
+      end
+      if same_multiset then
+        diag(
+          ctx,
+          lnum,
+          "warn",
+          "comment-reordered",
+          ("comment lists the same elements in a different order; the stack is %s here"):format(
+            M.render_cells(state)
+          )
+        )
+        return -- keep the simulated order; adopting the wrong one would hide it
+      end
+    end
+  end
   state.cells = cells
 end
 

@@ -84,7 +84,7 @@ local function publish(bufnr, result, cfg, drift)
   if cfg.diagnostics then
     for _, d in ipairs(result.diagnostics) do
       local skip = (d.severity == "hint" and not cfg.bail_hints)
-        or (d.code == "comment-stale" and not cfg.check_comments)
+        or ((d.code == "comment-stale" or d.code == "comment-reordered") and not cfg.check_comments)
       if not skip then
         items[#items + 1] = {
           lnum = d.lnum - 1,
@@ -133,7 +133,7 @@ local function render_overlay(bufnr, result, cfg)
   -- mode: the corrected state IS the payload there.
   local stale = {}
   for _, d in ipairs(result.diagnostics) do
-    if d.code == "comment-stale" then
+    if d.code == "comment-stale" or d.code == "comment-reordered" then
       stale[d.lnum] = true
     end
   end

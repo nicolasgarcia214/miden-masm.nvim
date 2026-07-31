@@ -21,17 +21,21 @@ make test          # navigation test suite (no network needed)
 make test-queries  # builds the pinned grammar, validates the queries
 ```
 
-`make test` runs three suites headlessly (`nvim --headless --clean`):
-`tests/masm_test.lua` (navigation), `tests/hover_test.lua` and
-`tests/stack_test.lua` (stack-list notation, instruction arities, the stack
-simulator and its UI) against the fixture project in `tests/fixtures/`,
+`make test` runs six suites headlessly (`nvim --headless --clean`):
+`tests/masm_test.lua` (navigation, references sync and async, rename, the
+dialect-drift canary), `tests/hover_test.lua`, `tests/stack_test.lua`
+(stack-list notation, instruction arities, the stack simulator including
+order-aware comment checking, and its UI) and `tests/complete_test.lua`
+(omnifunc contexts) against the fixture project in `tests/fixtures/`,
 which is a miniature Miden workspace -- two namespaced libraries, a renamed
 re-export chain, a kernel library, a single-file account component and an
 adversarial fixture; `tests/fixtures/app/stack.masm` ports the real
 min_burn_amount depth-17 bug as a regression pair -- plus
-`tests/ftplugin_test.lua` for filetype detection and the ftplugin's
-setup/teardown. No Miden checkout or network access is needed, and each
-suite exits non-zero on failure.
+`tests/dap_test.lua` (launch argv, port fallback and the spawn/readiness
+protocol against stub processes; nvim-dap registration against a stub
+module) and `tests/ftplugin_test.lua` for filetype detection and the
+ftplugin's setup/teardown. No Miden checkout, Miden binaries or network
+access are needed, and each suite exits non-zero on failure.
 
 `make test-queries` clones and compiles the pinned tree-sitter-masm revision
 (network + C compiler required), then asserts each query in `queries/masm/`
@@ -47,9 +51,14 @@ fixtures can evolve.
 ## Layout
 
 - `lua/masm/goto.lua` - all navigation: project index, import parsing,
-  symbol resolution, tagfunc, references, document symbols. Resolution is
-  deliberately text-based; see the header comment before reaching for
-  tree-sitter here.
+  symbol resolution, tagfunc, references (time-sliced scan driver), rename,
+  document symbols, the dialect-drift canary. Resolution is deliberately
+  text-based; see the header comment before reaching for tree-sitter here.
+- `lua/masm/complete.lua` - 'omnifunc' completion: context detection plus
+  candidate enumeration through goto's index and the instruction reference.
+- `lua/masm/dap.lua` - optional nvim-dap integration: launch argv
+  construction, port allocation, backend spawn/readiness, `miden/uiState`
+  capture and `:MasmDapState`. Inert without nvim-dap.
 - `lua/masm/hover.lua` - `K` hover: definition-site doc blocks via the
   resolver, instruction docs via the generated reference.
 - `lua/masm/stack.lua` - the stack-analysis engine: procedure segmentation,

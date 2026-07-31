@@ -19,8 +19,24 @@ static stack analysis, with no language server required.
   `(b, a, ...) → (overflow, (a + b) mod 2^32, ...)`).
 - Find references (`grr`) into the quickfix list, resolving every candidate
   usage to its ground-truth definition, so renamed re-exports are unified
-  correctly.
+  correctly. The scan runs time-sliced on the event loop, so even a huge
+  `extra_roots` never freezes the UI.
+- Project-wide rename (`grn` / `:MasmRename`): renames the definition, every
+  reference that spells the definition-site name, and the original side of
+  `use { orig as alias }` items -- alias spellings correctly survive. Edits
+  land in buffers, unsaved, for review.
+- Completion (`<C-x><C-o>`): after `exec.`/`call.`/`syscall.`/`procref.`
+  the resolvable targets (with each proc's `[inputs] -> [outputs]` contract
+  in the menu), after `push.` the visible constants, and at instruction
+  position every opcode with its stack effect from the instruction
+  reference.
 - Document symbols (`gO`) into the location list.
+- Debugging via [nvim-dap](https://github.com/mfussenegger/nvim-dap) (optional):
+  the plugin registers a `miden` adapter that attaches to a running Miden
+  DAP server or launches `miden-debug` / `miden-client exec` with
+  `--start-debug-adapter`, waiting for the server's readiness handshake.
+  `:MasmDapState` shows the VM cycle, operand stack and call stack the
+  adapter pushes before each stop.
 - Stack analysis: a per-instruction operand-stack simulator that catches the
   bug class the VM only rejects at runtime -- a `call`-invoked procedure not
   returning at stack depth exactly 16 (`InvalidStackDepthOnReturn`). In the
@@ -32,7 +48,13 @@ static stack analysis, with no language server required.
   declared `Inputs:/Outputs:` contracts against the 16-element call ABI, and
   offers an inferred-stack ghost-text overlay (`:MasmStackToggle`) showing
   `# => [VALUE, pad(16)]`-style state on lines that have no handwritten
-  annotation.
+  annotation. Comments that list the right elements in the wrong order --
+  the swapped-operands documentation bug width checking cannot see -- are
+  flagged whenever both sides are fully named.
+- A dialect-drift canary: resolution is text-based against the current
+  dialect's import forms, and a future form the resolver does not recognize
+  would otherwise fail silently. Any such `use` statement is published as an
+  `unrecognized-import` diagnostic instead.
 - Correct comment settings (`#` / `#!`), 4-space indentation, and matchit
   words for Miden's `proc`/`begin`/`if.true`/`while.true` ... `end` blocks
   (Neovim's built-in `masm` filetype targets Microsoft Macro Assembler and
@@ -47,6 +69,9 @@ indentation and folds need the tree-sitter parser.
 - Neovim 0.10.4+
 - [nvim-treesitter](https://github.com/nvim-treesitter/nvim-treesitter)
   (main branch) and a C compiler, for the optional parser
+- [nvim-dap](https://github.com/mfussenegger/nvim-dap), plus `miden-debug`
+  and/or `miden-client` builds supporting `--start-debug-adapter`, for the
+  optional debugger
 
 ## Installation
 
@@ -105,14 +130,39 @@ All mappings are buffer-local to `.masm` files:
   cursor closes it.
 - `grr` - find references project-wide, into the quickfix list with the
   definition first. On a module qualifier or `use` path it lists every
-  `use` statement importing that module.
+  `use` statement importing that module. The scan runs in the background;
+  the quickfix list opens when it completes.
+- `grn` or `:MasmRename [name]` - rename the symbol under the cursor
+  project-wide. Edits are applied to buffers and left unsaved for review
+  (`:wa` writes them, or undo per buffer). Sites importing the symbol under
+  an `as` alias keep their alias -- it still resolves.
+- `<C-x><C-o>` (insert mode) - complete invocation targets, constants and
+  opcodes from the same index navigation uses; proc candidates show their
+  `[inputs] -> [outputs]` contract, opcodes their stack effect.
 - `gO` - list the buffer's definitions (procs, consts, types, submodules,
   entrypoint) in the location list.
 - `:MasmRebuildIndex` - drop the cached project index (see below).
 - `:MasmStackToggle` - toggle the inferred-stack ghost-text overlay for this
   buffer. Stack diagnostics are on by default and refresh on `InsertLeave`,
   normal-mode edits (debounced) and every write; they render through your
-  normal `vim.diagnostic` configuration under the source name `masm-stack`.
+  normal `vim.diagnostic` configuration under the source name `masm-stack`
+  (`masm-goto` for the import-form canary).
+
+## Debugging
+
+With [nvim-dap](https://github.com/mfussenegger/nvim-dap) installed the
+plugin registers a `miden` adapter and three default configurations (your
+own `dap.configurations.masm` wins if you define one): debug the current
+file with `miden-debug`, debug a transaction script with
+`miden-client exec`, or attach to a DAP server on `127.0.0.1:4711`. Launch
+configs accept the same keys as the Miden VS Code extension (`program`,
+`inputs`, `entrypoint`, `sysroot`, `searchPath`, `linkLibraries`,
+`sourcePathPrefixes`, `programArgs`, `scriptPath`, `accountId`, `host`,
+`port`, `cwd`), with `${file}`/`${workspaceFolder}` substitution. The
+adapter waits for the backend's readiness line instead of probing the port
+-- the server accepts a single DAP connection and a probe would consume it.
+`:MasmDapState` shows the VM cycle, operand stack and call stack pushed via
+the `miden/uiState` event before each stop. See `:h miden-masm-dap`.
 
 ## How name resolution works
 
@@ -156,10 +206,10 @@ vim.g.masm_goto = {
   ignore_dirs = { "target", "node_modules" },
 }
 
--- Set this to define your own keymaps instead of the default gd/grr/gO/K
--- (call require("masm.goto").references() / .document_symbols() and
--- require("masm.hover").hover() directly; 'tagfunc' stays active either
--- way, so <C-]> and :tag keep working).
+-- Set this to define your own keymaps instead of the default gd/grr/grn/gO/K
+-- (call require("masm.goto").references() / .rename() / .document_symbols()
+-- and require("masm.hover").hover() directly; 'tagfunc' and 'omnifunc' stay
+-- active either way, so <C-]>, :tag and <C-x><C-o> keep working).
 vim.g.masm_no_default_mappings = true
 
 -- Set this if you wire up vim.treesitter.start()/indentexpr/foldexpr
@@ -178,6 +228,9 @@ vim.g.masm_stack = {
 
 -- Set this to disable stack analysis entirely (no autocmds, no command).
 vim.g.masm_no_stack = true
+
+-- Set this to keep the plugin away from nvim-dap entirely.
+vim.g.masm_no_dap = true
 ```
 
 Both list options also accept a single string as a one-element list.
@@ -193,24 +246,28 @@ Honest list, so you know what you are getting:
   lists of `pub mod` lines, parse entirely as errors). Procedure bodies
   highlight fine. This is also exactly why navigation is text-based instead
   of tree-sitter-based: the resolver must understand the statements the
-  grammar cannot.
+  grammar cannot. The pin is upstream HEAD -- there is no newer revision to
+  take; if the dialect grows an import form the resolver does not know
+  either, the `unrecognized-import` canary reports it instead of silently
+  missing it.
 - Navigation is resolution by convention, not by executing the assembler:
   it does not model conditional compilation, shadowing, or dialect corners
   the regexes do not cover. Unresolvable names report a reason (e.g. which
   module was not found) rather than guessing.
 - `std::` / `miden::core::` targets need `extra_roots` (see above), since
   those sources ship with miden-vm, not with user projects.
-- References scan files on disk (plus the current buffer's unsaved text);
-  other modified-but-unsaved buffers are read from disk. In particular, if
-  the definition itself lives in another unsaved buffer, references are
-  computed against its on-disk line numbers until it is saved.
 - Re-export chains are followed up to 5 hops; deeper chains report "not
   found". Cyclic chains are detected and fail cleanly. Retargeting a
   `pub use` line in the middle of a 3+ hop chain can keep serving the old
   destination for already-resolved names until `:MasmRebuildIndex`.
-- The index walk and references scan are synchronous. The quoted timings are
-  for a ~180-file project; a large `extra_roots` (a full miden-vm checkout)
-  proportionally slows the first jump and every `grr`.
+- The first jump builds the project index synchronously (one bounded
+  directory walk). References and rename scans read every loaded buffer's
+  live text (falling back to disk); references run time-sliced in the
+  background, while rename deliberately scans synchronously so its
+  positions cannot race your edits.
+- Rename rewrites the definition-site spelling wherever it appears; alias
+  spellings (`use { x as y }`) keep their alias, and generated code or
+  docs outside `.masm` files are not touched.
 - Definition positions are re-read whenever a file's mtime changes, so
   ordinary edit-and-save cycles are picked up automatically. The project
   index itself (which files and libraries exist) refreshes only on
@@ -231,14 +288,17 @@ Honest list, so you know what you are getting:
   stack floor has an internals-dependent exact depth and is likewise
   resynchronized from the next comment. Comments in `exec`-invoked
   procedures are checked for adoption but never flagged (they legitimately
-  mix declared-inputs and caller views); wrong element *order* is invisible
-  whenever the widths still match. An unknown instruction skips the whole
-  procedure with a stated reason rather than guessing.
-- No completion or rename, and no diagnostics beyond stack analysis. For
-  assembler diagnostics there is
-  [miden-lsp](https://github.com/0xMiden/miden-lsp); note it derives syntax
-  errors from the same stale grammar, so expect false positives on import
-  headers.
+  mix declared-inputs and caller views); wrong element *order* is caught
+  only when both the comment and the simulation are fully named with
+  matching name multisets -- renamed elements in the wrong order remain
+  invisible. An unknown instruction skips the whole procedure with a stated
+  reason rather than guessing.
+- Debugging requires nvim-dap and miden-debug / miden-client builds that
+  support `--start-debug-adapter`.
+- No assembler diagnostics beyond stack analysis and the import canary. For
+  those there is [miden-lsp](https://github.com/0xMiden/miden-lsp) (usable
+  alongside this plugin via `vim.lsp.start`); note it derives syntax errors
+  from the same stale grammar, so expect false positives on import headers.
 
 ## Contributing
 

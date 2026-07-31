@@ -6,6 +6,34 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- Completion via 'omnifunc' (`<C-x><C-o>`): invocation targets after
+  `exec.`/`call.`/`syscall.`/`procref.` (local procs, imported symbols,
+  module qualifiers, and a module's procs after `mod::`), constants after
+  `push.`, and opcodes/keywords at instruction position -- all from the same
+  index navigation uses. Procedure candidates show their
+  `[inputs] -> [outputs]` doc contract in the menu, opcodes their stack
+  effect.
+- Project-wide rename (`grn` / `:MasmRename`): renames the definition,
+  references that spell the definition-site name and the original side of
+  importing/re-exporting `use { orig as alias }` items, while alias
+  spellings survive. Edits are verified against buffer content, applied
+  bottom-up and left unsaved for review.
+- Optional debugger integration with nvim-dap: a `miden` adapter that
+  attaches to a running Miden DAP server or launches
+  `miden-debug --start-debug-adapter` / `miden-client exec
+  --start-debug-adapter` with free-port fallback and readiness detection,
+  plus `:MasmDapState` showing the VM cycle, operand stack and call stack
+  from the `miden/uiState` event. Inert without nvim-dap; opt out with
+  `vim.g.masm_no_dap`.
+- Order-aware stack comment checking (`comment-reordered`): a `# => [...]`
+  comment listing exactly the simulated stack's named elements in a
+  different order is flagged -- the swapped-operands documentation bug that
+  width checking cannot see. Renamed or anonymous elements can never trip
+  it.
+- Dialect-drift canary (`unrecognized-import`): `use` statements matching
+  none of the resolver's known forms are published as diagnostics, so a
+  future dialect change degrades loudly instead of silently.
+
 - Static stack analysis: a per-instruction operand-stack simulator publishes
   `vim.diagnostic` errors when a `call`-invoked procedure would return at a
   stack depth other than the mandatory 16 (the VM rejects every such call at
@@ -23,6 +51,15 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/).
   re-exports work), module doc blocks on qualifiers, and description plus
   stack effect for bare opcodes from the bundled Miden instruction
   reference. A second `K` focuses the float.
+
+### Changed
+
+- The references scan runs time-sliced on the event loop instead of
+  blocking the UI thread; the quickfix list opens on completion, and a new
+  scan cancels the one in flight. `references({ sync = true })` keeps the
+  blocking behavior and returns the items.
+- References and rename scans read the live text of every loaded buffer,
+  not just the current one, so unsaved edits elsewhere are seen.
 
 ### Fixed
 

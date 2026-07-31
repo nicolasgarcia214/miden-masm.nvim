@@ -9,10 +9,12 @@ CONTENTS                                                          *miden-masm*
   1. Introduction ................................. |miden-masm-introduction|
   2. Mappings ......................................... |miden-masm-mappings|
   3. Commands ......................................... |miden-masm-commands|
-  4. Stack analysis .................................... |miden-masm-stack|
-  5. Configuration ...................................... |miden-masm-config|
-  6. Name resolution ................................ |miden-masm-resolution|
-  7. Limitations .................................... |miden-masm-limitations|
+  4. Completion ..................................... |miden-masm-completion|
+  5. Stack analysis .................................... |miden-masm-stack|
+  6. Debugger ............................................. |miden-masm-dap|
+  7. Configuration ...................................... |miden-masm-config|
+  8. Name resolution ................................ |miden-masm-resolution|
+  9. Limitations .................................... |miden-masm-limitations|
 
 ==============================================================================
 1. INTRODUCTION                                      *miden-masm-introduction*
@@ -25,12 +27,16 @@ miden-masm.nvim provides Miden Assembly (`.masm`) support:
   calls `vim.treesitter.start()` and sets 'indentexpr'/'foldexpr', since
   nvim-treesitter's main branch enables nothing by itself. Opt out with
   |g:masm_no_treesitter|.
-- go-to-definition, references, document symbols and hover docs, implemented
-  with plain text analysis of the project: no language server and no parser
-  required
+- go-to-definition, references, project-wide rename, document symbols,
+  completion and hover docs, implemented with plain text analysis of the
+  project: no language server and no parser required
 - static stack analysis: per-instruction operand-stack simulation with
-  |vim.diagnostic| errors for call-ABI violations and stale `# => [...]`
-  comments, plus an inferred-stack ghost-text overlay (|:MasmStackToggle|)
+  |vim.diagnostic| errors for call-ABI violations and stale or reordered
+  `# => [...]` comments, plus an inferred-stack ghost-text overlay
+  (|:MasmStackToggle|)
+- optional debugging through |nvim-dap|: the plugin registers the `miden`
+  adapter and launch/attach configurations for `miden-debug` and
+  `miden-client` (|miden-masm-dap|)
 
 Neovim ships a `masm` filetype for Microsoft Macro Assembler; this plugin
 corrects its settings (comments, indentation, matchit words) for Miden in
@@ -71,7 +77,14 @@ grr                Find references to the symbol under the cursor across the
                    Every candidate usage is resolved to its definition, so
                    usages through renamed imports and re-export chains are
                    included. On a module qualifier, list the `use` statements
-                   importing that module instead.
+                   importing that module instead. The scan runs in the
+                   background (time-sliced on the event loop) and opens the
+                   quickfix list when it completes; starting a new scan
+                   cancels the one in flight.
+
+                                                              *miden-masm-grn*
+grn                Rename the symbol under the cursor across the project
+                   (prompts for the new name). See |:MasmRename|.
 
                                                                *miden-masm-gO*
 gO                 List the buffer's definitions (procs, consts, types,
@@ -88,12 +101,49 @@ gO                 List the buffer's definitions (procs, consts, types,
                    existing files do not need this: definition positions are
                    re-read whenever a file's mtime changes.
 
+                                                                 *:MasmRename*
+:MasmRename [name] Rename the symbol under the cursor across the project
+                   (prompting when [name] is omitted). Renames the
+                   definition, every reference that spells the
+                   definition-site name, and the original side of importing
+                   or re-exporting `use { orig as alias }` items; sites that
+                   use an `as` alias keep their alias, which still resolves.
+                   Edits are applied to buffers and left unsaved for review
+                   -- inspect with |:ls|, write with |:wa|, or undo per
+                   buffer. Modules cannot be renamed (their name is a file
+                   name).
+
                                                             *:MasmStackToggle*
 :MasmStackToggle   Toggle the inferred-stack ghost-text overlay for the
                    current buffer. See |miden-masm-stack|.
 
+                                                               *:MasmDapState*
+:MasmDapState      Show the Miden VM state (cycle, operand stack, call
+                   stack) most recently pushed by the debug adapter, in a
+                   floating window. Only defined when |nvim-dap| is
+                   installed. See |miden-masm-dap|.
+
 ==============================================================================
-4. STACK ANALYSIS                                           *miden-masm-stack*
+4. COMPLETION                                          *miden-masm-completion*
+
+The ftplugin sets 'omnifunc' (CTRL-X CTRL-O in insert mode). Candidates come
+from the same index and imports navigation uses, so the list is exactly the
+set of names `gd` could resolve:
+
+- after `exec.` / `call.` / `procref.`: local procedures, imported symbols
+  and module qualifiers; after `exec.mod::`, that module's procedures
+  (re-exports included, renames applied)
+- after `syscall.`: the kernel library's procedures
+- after `push.`: constants -- local, imported and `mod::`-qualified
+- at an instruction position: opcodes from the bundled Miden instruction
+  reference, each showing its stack effect in the popup menu and its
+  description in the preview/info float, plus control-flow keywords
+
+Procedure candidates show the callee's `[inputs] -> [outputs]` doc contract
+in the menu -- the de facto type signature in Miden code.
+
+==============================================================================
+5. STACK ANALYSIS                                           *miden-masm-stack*
 
 The analyzer simulates the operand stack instruction by instruction inside
 every procedure that declares how it is invoked (`#! Invocation:` doc tag,
@@ -115,6 +165,12 @@ itself. Codes:
                            mandatory 16 elements.
   comment-stale     WARN   A handwritten `# => [...]` comment disagrees with
                            the simulated stack width at that point.
+  comment-reordered WARN   A handwritten comment lists exactly the same
+                           named elements as the simulation but in a
+                           different order -- a swapped-operands comment.
+                           Only raised when every element is named on both
+                           sides and the name multisets match, so renamed
+                           or anonymous elements can never trip it.
   exec-net          WARN   An `exec`-invoked procedure's body leaves a
                            different number of elements than its `Outputs:`
                            declares.
@@ -130,6 +186,17 @@ itself. Codes:
                            analysis resumes at the next `# => [...]` comment.
                            Hidden unless `bail_hints` is set.
 
+One diagnostic comes from the resolver rather than the simulator (source
+`masm-goto`):
+
+  unrecognized-import WARN A `use` statement matches none of the forms the
+                           resolver understands. Resolution is text-based
+                           against the current dialect's import forms; a
+                           future form would otherwise fail silently
+                           (imports not seen, navigation and callee
+                           contracts quietly degraded). This canary makes
+                           dialect drift loud instead.
+
 The overlay (off by default, |:MasmStackToggle|) appends ghost text like
 `# => [VALUE, pad(16)]` at end of line, in the same notation Miden code uses
 for handwritten comments. In "auto" mode only lines without a handwritten
@@ -144,7 +211,38 @@ per-procedure instruction budgets and cross-file lookup budgets all degrade
 to skipped procedures with a stated reason, never to guesses.
 
 ==============================================================================
-5. CONFIGURATION                                           *miden-masm-config*
+6. DEBUGGER                                                   *miden-masm-dap*
+
+When nvim-dap (https://github.com/mfussenegger/nvim-dap) is installed, the
+plugin registers a `miden` debug adapter and three default configurations
+for `masm` buffers (your own `dap.configurations.masm`, if set, is left
+untouched):
+
+- "Debug current file (miden-debug)": launches
+  `miden-debug --start-debug-adapter` on the current `.masm`/`.masp` file
+- "Debug transaction script (miden-client)": launches
+  `miden-client exec --script-path <file> --start-debug-adapter`
+- "Attach to Miden DAP server": connects to 127.0.0.1:4711
+
+Launching picks a free local port (falling back from the configured one)
+and waits for the backend's "DAP server listening" line before connecting;
+a probe connection would consume the single DAP connection the server
+accepts. Backend output is shown on failure. The backends must support
+`--start-debug-adapter` (recent miden-debug / miden-client builds).
+
+Launch configuration keys (nvim-dap substitutes `${file}` and
+`${workspaceFolder}`): `program`, `midenDebugPath`, `inputs`, `entrypoint`,
+`sysroot`, `searchPath`, `linkLibraries`, `sourcePathPrefixes`,
+`programArgs` (miden-debug); `scriptPath`, `midenClientPath`, `accountId`
+(miden-client); `runtime` ("debugger"/"client", inferred from
+`program`/`scriptPath` when omitted); `host`, `port`, `cwd` (both).
+
+Before each stop the adapter pushes a `miden/uiState` event with the VM
+cycle, operand stack and call stack; |:MasmDapState| shows the latest one.
+Disable the whole integration with |g:masm_no_dap|.
+
+==============================================================================
+7. CONFIGURATION                                           *miden-masm-config*
 
                                                                  *g:masm_goto*
 g:masm_goto        Optional table: >lua
@@ -164,11 +262,11 @@ g:masm_goto        Optional table: >lua
                                                    *g:masm_no_default_mappings*
 g:masm_no_default_mappings
                    When true, the plugin defines no keymaps; call
-                   `require("masm.goto").references()`,
+                   `require("masm.goto").references()`, `.rename()`,
                    `.document_symbols()` and
                    `require("masm.hover").hover()` from your own mappings.
-                   'tagfunc' is still set, so CTRL-] and |:tag| keep
-                   working.
+                   'tagfunc' and 'omnifunc' are still set, so CTRL-],
+                   |:tag| and CTRL-X CTRL-O keep working.
 
                                                         *g:masm_no_treesitter*
 g:masm_no_treesitter
@@ -197,8 +295,12 @@ g:masm_no_stack    When true, stack analysis is not wired at all for new
                    `masm` buffers: no autocmds, no |:MasmStackToggle|, zero
                    cost.
 
+                                                               *g:masm_no_dap*
+g:masm_no_dap      When true, nothing is registered with nvim-dap and
+                   |:MasmDapState| is not defined.
+
 ==============================================================================
-6. NAME RESOLUTION                                     *miden-masm-resolution*
+8. NAME RESOLUTION                                     *miden-masm-resolution*
 
 The resolver mirrors the Miden assembler's project model:
 
@@ -218,21 +320,25 @@ The index roots at the git root (or the outermost directory containing a
 `miden-project.toml`) and is cached for the session.
 
 ==============================================================================
-7. LIMITATIONS                                        *miden-masm-limitations*
+9. LIMITATIONS                                        *miden-masm-limitations*
 
-- The pinned tree-sitter grammar predates the current dialect: `use {..}
-  from ..`, `pub mod` and `use .. as ..` parse as ERROR nodes, which mainly
-  affects import headers (and `mod.masm` files). Navigation is text-based
-  for exactly this reason and is unaffected.
+- The pinned tree-sitter grammar (upstream HEAD -- there is nothing newer to
+  pin) predates the current dialect: `use {..} from ..`, `pub mod` and
+  `use .. as ..` parse as ERROR nodes, which mainly affects import headers
+  (and `mod.masm` files). Navigation is text-based for exactly this reason
+  and is unaffected; unrecognized future import forms surface as
+  `unrecognized-import` diagnostics rather than failing silently.
 - Resolution is by convention, not by running the assembler; unresolvable
   names report a reason instead of guessing.
 - Re-export chains are followed up to 5 hops; deeper chains report "not
   found". Cycles are detected and fail cleanly.
-- References read other files from disk; unsaved changes in buffers other
-  than the current one are not seen.
-- The index walk and references scan run synchronously; very large trees
-  (e.g. a full miden-vm checkout in `extra_roots`) slow the first jump and
-  every references scan proportionally.
+- The first jump builds the project index synchronously (one bounded
+  directory walk); reference scans and renames read files as they go, so a
+  very large `extra_roots` still costs time -- but references no longer
+  block the UI while scanning.
+- Rename rewrites the definition-site spelling everywhere it appears; it
+  does not offer to rename aliases (`use { x as y }` keeps `y`), and it
+  cannot know about generated code or docs outside `.masm` files.
 - Hover shows what the definition site documents. The instruction reference
   is a generated snapshot (see `lua/masm/instructions.lua` for provenance).
 - Stack analysis is a static approximation: absence of diagnostics is not a
@@ -241,9 +347,11 @@ The index roots at the git root (or the outermost directory containing a
   unknown until the next handwritten `# => [...]` comment; `exec`s that
   reach the 16-element floor have internals-dependent depth and are likewise
   resynchronized from comments; comments in `exec`-invoked procedures are
-  never flagged (they legitimately mix views); wrong element ORDER is
-  invisible while widths match; unknown instructions skip the procedure with
-  a stated reason.
-- No completion or rename; no diagnostics beyond stack analysis.
+  never flagged (they legitimately mix views); a reordered comment is only
+  caught when both sides are fully named with matching multisets -- renamed
+  elements in the wrong order remain invisible; unknown instructions skip
+  the procedure with a stated reason.
+- Debugging needs nvim-dap plus miden-debug / miden-client builds that
+  support `--start-debug-adapter`.
 
 vim:tw=78:ts=8:noet:ft=help:norl:

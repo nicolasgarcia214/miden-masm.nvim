@@ -237,10 +237,7 @@ local function scan_procs(lines, code_only)
     local is_begin = code:match("^%s*begin%f[^%w_]") ~= nil
     if decl or is_begin then
       local name = decl and code:match("proc%s+([%w_%$]+)") or "begin"
-      local doc, attrs, doc_lnum = {}, {}, i
-      if decl then
-        doc, attrs, doc_lnum = doc_block_above(lines, i)
-      end
+      local doc, attrs, doc_lnum = doc_block_above(lines, i)
       -- A typed signature may wrap over several lines; the body starts
       -- after its parentheses balance.
       local body_first = i + 1
@@ -281,7 +278,9 @@ local function scan_procs(lines, code_only)
         j = j + 1
       end
       local contract = notation.contract(doc)
-      local invocation = contract.invocation
+      -- `begin..end` is the program entrypoint: it always runs on the
+      -- 16-element physical stack, whatever the doc block says.
+      local invocation = is_begin and "entrypoint" or contract.invocation
       local inferred = false
       if not invocation then
         for _, a in ipairs(attrs) do
@@ -316,10 +315,12 @@ local function scan_procs(lines, code_only)
         diagnostics = {},
         states = {},
       }
+      -- Entrypoints are analyzed (they are in `list`) but can never be a
+      -- callee, so only proc declarations enter the by-line contract map.
       if decl then
         by_lnum[i] = proc
-        list[#list + 1] = proc
       end
+      list[#list + 1] = proc
       i = (end_lnum or #lines) + 1
     else
       i = i + 1
@@ -333,9 +334,11 @@ end
 ---------------------------------------------------------------------------
 
 local contract_cache = {}
+local lines_cache = {}
 
 function M.clear_cache()
   contract_cache = {}
+  lines_cache = {}
 end
 
 local function goto_mod()
@@ -426,6 +429,28 @@ local function callee_contract(ctx, target, kind)
   return proc.contract
 end
 
+-- Raw lines of an on-disk file for constant-definition lookups, cached
+-- under the file's freshness key like every other callee lookup (an
+-- analysis pass may resolve many `push.CONST`s against the same module).
+local function file_lines_cached(path)
+  local g = goto_mod()
+  local key = g._stat_key(path)
+  if not key then
+    return nil, "cannot stat " .. path
+  end
+  local hit = lines_cache[path]
+  if hit and hit.key == key then
+    return hit.lines
+  end
+  local text = g._read_file(path)
+  if not text then
+    return nil, "cannot read " .. path
+  end
+  local lines = vim.split(text, "\n", { plain = true })
+  lines_cache[path] = { key = key, lines = lines }
+  return lines
+end
+
 -- Resolves `push.CONST`: how many felts does the constant push?
 -- A `word("...")` constant pushes 4; any other single value pushes 1.
 local function const_width(ctx, name)
@@ -441,12 +466,10 @@ local function const_width(ctx, name)
   if item.filename == ctx.bufpath then
     line = ctx.lines[tonumber(item.cmd)]
   else
-    local g = goto_mod()
-    local text = g._read_file(item.filename)
-    if not text then
-      return nil, "cannot read " .. item.filename
+    local lines, err = file_lines_cached(item.filename)
+    if not lines then
+      return nil, err
     end
-    local lines = vim.split(text, "\n", { plain = true })
     line = lines[tonumber(item.cmd)]
   end
   if not line then
@@ -1299,6 +1322,25 @@ end
 
 local function entry_state(proc)
   local c = proc.contract
+  -- Program entrypoints run on the physical stack: their declared inputs
+  -- (padded to 16 with the VM's zero-fill) when a parseable contract says
+  -- so, otherwise 16 unknown input elements. Always floored -- begin IS the
+  -- 16-element stack.
+  if proc.invocation == "entrypoint" then
+    local cells
+    if c.inputs and not c.inputs.lower_bound and c.inputs.width <= 16 then
+      cells = notation.expand(c.inputs)
+      for _, cell in ipairs(cells) do
+        cell.origin = "input"
+      end
+      for _, cell in ipairs(zero_cells(16 - #cells)) do
+        cells[#cells + 1] = cell
+      end
+    else
+      cells = anon_cells(16, "input")
+    end
+    return new_state("floored", cells)
+  end
   if FLOORED_INVOCATIONS[proc.invocation] then
     if c.inputs and not c.inputs.lower_bound and c.inputs.width == 16 then
       local cells = notation.expand(c.inputs)
@@ -1374,7 +1416,11 @@ local function analyze_proc(ctx)
     proc.bailed = "unterminated procedure"
     return
   end
-  if not FLOORED_INVOCATIONS[proc.invocation] and not RELATIVE_INVOCATIONS[proc.invocation] then
+  if
+    not FLOORED_INVOCATIONS[proc.invocation]
+    and not RELATIVE_INVOCATIONS[proc.invocation]
+    and proc.invocation ~= "entrypoint"
+  then
     proc.bailed = ("unknown invocation kind %q"):format(proc.invocation)
     return
   end
@@ -1420,7 +1466,22 @@ local function analyze_proc(ctx)
 
   -- Exit checks ----------------------------------------------------------
   if state.mode == "floored" then
-    if not state.poisoned and #state.cells ~= 16 then
+    -- Entrypoints have no return-depth contract to violate: the floor keeps
+    -- them at >= 16, and the VM caps program stack outputs at 16, so only
+    -- ending DEEPER than 16 is an error.
+    if proc.invocation == "entrypoint" then
+      if not state.poisoned and #state.cells > 16 then
+        diag(
+          ctx,
+          proc.end_lnum,
+          "error",
+          "exit-depth",
+          ("program ends with %d stack elements; the VM rejects executions ending deeper than 16 (stack outputs are capped at 16)"):format(
+            #state.cells
+          )
+        )
+      end
+    elseif not state.poisoned and #state.cells ~= 16 then
       diag(
         ctx,
         proc.end_lnum,

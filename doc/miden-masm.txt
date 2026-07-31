@@ -148,9 +148,13 @@ in the menu -- the de facto type signature in Miden code.
 The analyzer simulates the operand stack instruction by instruction inside
 every procedure that declares how it is invoked (`#! Invocation:` doc tag,
 or a `@note_script`-style attribute with a padded 16-element `Inputs:`
-contract). Cross-procedure effects come from the callee's declared
-`#! Inputs:`/`#! Outputs:` stack contract -- callee bodies are never
-analyzed on behalf of a caller.
+contract), and inside every `begin..end` entrypoint block -- entrypoints
+always run on the 16-element physical stack (declared `#! Inputs:` enter
+named and zero-padded to 16; without a contract they enter unknown), and
+since the VM caps program stack outputs at 16, a program ending deeper
+than 16 is flagged as an error. Cross-procedure effects come from the
+callee's declared `#! Inputs:`/`#! Outputs:` stack contract -- callee
+bodies are never analyzed on behalf of a caller.
 
 Diagnostics are published through |vim.diagnostic| (source `masm-stack`) and
 render however your diagnostic config says; the plugin never draws them
@@ -332,6 +336,9 @@ The index roots at the git root (or the outermost directory containing a
   names report a reason instead of guessing.
 - Re-export chains are followed up to 5 hops; deeper chains report "not
   found". Cycles are detected and fail cleanly.
+- A multi-line `use { .. } from` block longer than 40 lines is not
+  recognized when the cursor is inside its braces (real-world blocks run to
+  ~20 lines).
 - The first jump builds the project index synchronously (one bounded
   directory walk); reference scans and renames read files as they go, so a
   very large `extra_roots` still costs time -- but references no longer

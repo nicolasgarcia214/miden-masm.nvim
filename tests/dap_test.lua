@@ -181,6 +181,14 @@ check(
 stub.listeners.after["event_miden/uiState"]["masm"](nil, { cycle = 7, current_stack = {} })
 check("adapter fn: uiState captured", dap2._ui_state ~= nil and dap2._ui_state.cycle == 7)
 
+-- Launch-setup failure must resume nvim-dap's suspended coroutine with nil
+-- (its adapter validation aborts on it), never leave the callback uncalled.
+local failed_cb, failed_val = false, "sentinel"
+stub.adapters.miden(function(cfg)
+  failed_cb, failed_val = true, cfg
+end, { request = "launch" })
+check("adapter fn: setup failure resumes callback with nil", failed_cb and failed_val == nil)
+
 local lines = dap._render_state({
   cycle = 42,
   current_stack = { 7, 3 },

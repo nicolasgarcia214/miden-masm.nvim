@@ -51,6 +51,17 @@ local cases = {
     expect_line = "proc add_checked",
   },
   {
+    -- Cursor on the `exec` keyword itself targets the whole invocation,
+    -- exactly like the unqualified `exec.local_helper` case -- not the
+    -- first qualifier segment.
+    desc = "cursor on exec keyword of a qualified call -> the target proc",
+    file = "app/main.masm",
+    find = "exec.math::add_checked",
+    off = 0,
+    expect_file = "core_lib/math.masm",
+    expect_line = "proc add_checked",
+  },
+  {
     desc = "selective const import: push.MAX_VALUE",
     file = "app/main.masm",
     find = "push.MAX_VALUE",
@@ -329,6 +340,15 @@ check(
     and tag_res[1]
     and tag_res[1].filename:find("core_lib/math.masm", 1, true) ~= nil,
   vim.inspect(tag_res)
+)
+
+-- A single `:` is not a MASM path separator; resolving `math:add_checked`
+-- as if it were `::` would navigate code the assembler rejects.
+local colon_res = goto_mod.tagfunc("math:add_checked", "", {})
+check(
+  "tagfunc: single-colon paths are rejected",
+  colon_res ~= vim.NIL and #colon_res == 0,
+  vim.inspect(colon_res)
 )
 
 -- Malformed module paths (`use ::`) in indexed files: resolving the broken

@@ -33,6 +33,10 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/).
 - Dialect-drift canary (`unrecognized-import`): `use` statements matching
   none of the resolver's known forms are published as diagnostics, so a
   future dialect change degrades loudly instead of silently.
+- `begin..end` entrypoint blocks are analyzed: they enter on the 16-element
+  physical stack (declared `#! Inputs:` named and zero-padded), trackers
+  and branches are checked like any procedure, and a program ending deeper
+  than 16 is an error (the VM caps stack outputs at 16).
 
 - Static stack analysis: a per-instruction operand-stack simulator publishes
   `vim.diagnostic` errors when a `call`-invoked procedure would return at a
@@ -63,6 +67,14 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- `gd` on the `exec`/`call` keyword of a qualified invocation
+  (`exec.math::add`) jumped to the module file instead of the invoked
+  procedure; the retargeted token now resolves its final segment.
+- Single-colon paths (`math:add`) resolved as if they were `::`; they are
+  now rejected -- the assembler rejects them too.
+- A launch-setup failure in the nvim-dap adapter left the session start
+  suspended (the callback was never invoked); it now resumes nvim-dap with
+  an abort.
 - `.masm` files were left with filetype `conf` on Neovim 0.10 (built-in
   `*.masm` detection only ships with 0.11), so none of the plugin activated;
   the plugin now registers the filetype mapping itself.

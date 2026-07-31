@@ -193,6 +193,10 @@ local registered = false
 -- :MasmDapState shows it in a float.
 M._ui_state = nil
 
+-- Failure paths resume nvim-dap's suspended coroutine with nil (which its
+-- adapter validation rejects and aborts on) instead of never calling
+-- `callback` -- an uncalled callback leaves the session start suspended
+-- forever. Our specific reason is notified first.
 local function adapter(callback, config)
   local host = config.host or "127.0.0.1"
   if config.request == "attach" then
@@ -202,17 +206,20 @@ local function adapter(callback, config)
   local port = M._free_port(host, config.port or 4711)
   if not port then
     vim.notify("masm dap: could not allocate a local port on " .. host, vim.log.levels.ERROR)
+    callback(nil)
     return
   end
   local spec, reason = M._build_launch(config, host .. ":" .. port)
   if not spec then
     vim.notify("masm dap: " .. reason, vim.log.levels.ERROR)
+    callback(nil)
     return
   end
   M._start_adapter(spec, function(err)
     if err then
       local tail = table.concat(M._last_output or {}):sub(-800)
       vim.notify("masm dap: " .. err .. (tail ~= "" and ("\n" .. tail) or ""), vim.log.levels.ERROR)
+      callback(nil)
       return
     end
     callback({ type = "server", host = host, port = port })

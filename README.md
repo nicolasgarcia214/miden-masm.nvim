@@ -259,7 +259,9 @@ Honest list, so you know what you are getting:
 - Re-export chains are followed up to 5 hops; deeper chains report "not
   found". Cyclic chains are detected and fail cleanly. Retargeting a
   `pub use` line in the middle of a 3+ hop chain can keep serving the old
-  destination for already-resolved names until `:MasmRebuildIndex`.
+  destination for already-resolved names until `:MasmRebuildIndex`. A
+  multi-line `use { .. } from` block longer than 40 lines is not recognized
+  from inside its braces.
 - The first jump builds the project index synchronously (one bounded
   directory walk). References and rename scans read every loaded buffer's
   live text (falling back to disk); references run time-sliced in the
@@ -281,7 +283,9 @@ Honest list, so you know what you are getting:
   diagnostics is not a correctness proof. Procedures without a
   `#! Invocation:` doc tag (or a script attribute with a padded 16-element
   `Inputs:` contract) are skipped -- that includes most kernel-internal code
-  by design. `dynexec`/`dyncall` targets and `exec` callees without parseable
+  by design. `begin` entrypoint blocks are always analyzed (they run on the
+  16-element physical stack; ending deeper than 16 is an error, since the
+  VM caps program stack outputs at 16). `dynexec`/`dyncall` targets and `exec` callees without parseable
   `Inputs:/Outputs:` contracts make the state unknown until the next
   handwritten `# => [...]` comment resynchronizes it (opt into seeing these
   with `bail_hints`). An `exec` whose consumption reaches the 16-element

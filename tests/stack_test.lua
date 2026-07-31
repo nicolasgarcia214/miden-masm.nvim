@@ -517,6 +517,58 @@ end
 check("order: anonymous cells exempt", not anon_flagged)
 
 ---------------------------------------------------------------------------
+-- engine: begin..end entrypoint blocks are analyzed (floored, 16-element)
+---------------------------------------------------------------------------
+
+-- A program ending deeper than 16 is rejected by the VM (outputs cap at 16).
+vres = analyze_virtual({ "begin", "    push.1", "end" })
+local entry_diag = vres and vres.diagnostics[1]
+check(
+  "entrypoint: ending deeper than 16 flagged",
+  entry_diag ~= nil and entry_diag.code == "exit-depth" and entry_diag.severity == "error",
+  vim.inspect(entry_diag)
+)
+
+-- Depth-neutral programs are fine; ending at exactly 16 has no error.
+vres = analyze_virtual({ "begin", "    push.1", "    drop", "end" })
+check("entrypoint: neutral program silent", vres ~= nil and #vres.diagnostics == 0)
+
+-- Declared inputs enter named and zero-padded to 16; trackers are checked.
+-- (`# => [sum]` alone would be accepted as a legitimate prefix-only claim;
+-- a claim that accounts for padding but gets the total wrong is the bug.)
+vres = analyze_virtual({
+  "#! Inputs: [a, b]",
+  "begin",
+  "    add",
+  "    # => [sum, pad(16)]",
+  "end",
+})
+local entry_stale
+for _, d in ipairs(vres and vres.diagnostics or {}) do
+  if d.code == "comment-stale" then
+    entry_stale = d
+  end
+end
+check(
+  "entrypoint: wrong-width tracker flagged",
+  entry_stale ~= nil and entry_stale.lnum == 4,
+  vim.inspect(vres and vres.diagnostics)
+)
+vres = analyze_virtual({
+  "#! Inputs: [a, b]",
+  "begin",
+  "    add",
+  "    # => [sum, pad(15)]",
+  "end",
+})
+check("entrypoint: full-width tracker accepted", vres ~= nil and #vres.diagnostics == 0)
+local begin_proc = vres and vres.procs[1]
+check(
+  "entrypoint: overlay state available for begin",
+  begin_proc ~= nil and begin_proc.name == "begin" and next(begin_proc.states) ~= nil
+)
+
+---------------------------------------------------------------------------
 -- stackview: diagnostics publishing, config gates, overlay extmarks
 ---------------------------------------------------------------------------
 

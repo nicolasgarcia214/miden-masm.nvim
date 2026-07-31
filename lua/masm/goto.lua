@@ -56,7 +56,14 @@ local function get_config()
   }
 end
 
+-- Splits `a::b::c` into segments. A single `:` is not a MASM path separator
+-- (the assembler rejects `a:b`); treating it as one would happily resolve
+-- code that does not compile, so malformed paths yield zero segments and
+-- resolution reports "not found" downstream.
 local function split_path(path)
+  if path:gsub("::", ""):find(":", 1, true) then
+    return {}
+  end
   local segs = {}
   for seg in path:gmatch("[^:]+") do
     table.insert(segs, seg)
@@ -747,10 +754,11 @@ local function cursor_target()
     end
     init = te + 1
   end
-  local kind
+  local kind, retargeted
   if INVOKE_KINDS[token] and line:sub(e + 1, e + 1) == "." then
     -- Cursor on `exec` itself: the target is the token after the dot.
     kind = token
+    retargeted = true
     s = e + 2
     token = line:match("^[%w_%$:]+", s)
     if not token then
@@ -767,16 +775,25 @@ local function cursor_target()
     return nil
   end
   local segs = split_path(token)
-  -- Which segment is the cursor on?
-  local active, off = #segs, math.max(col + 1 - s, 0)
-  local pos = 0
-  for i, seg in ipairs(segs) do
-    pos = pos + #seg
-    if off < pos + 2 then -- +2 tolerates the cursor sitting on the `::`
-      active = i
-      break
+  if #segs == 0 then
+    return nil
+  end
+  -- Which segment is the cursor on? When the cursor sat on the `exec`
+  -- keyword itself the target is the whole invocation, not a qualifier: the
+  -- cursor offset lies before the retargeted token and would otherwise
+  -- select segment 1 (the module) instead of the invoked name.
+  local active = #segs
+  if not retargeted then
+    local off = math.max(col + 1 - s, 0)
+    local pos = 0
+    for i, seg in ipairs(segs) do
+      pos = pos + #seg
+      if off < pos + 2 then -- +2 tolerates the cursor sitting on the `::`
+        active = i
+        break
+      end
+      pos = pos + 2
     end
-    pos = pos + 2
   end
   return { token = token, segs = segs, active = active, kind = kind, line = line }
 end
@@ -1336,6 +1353,7 @@ function M.rename(new_name)
     return nil, "invalid name"
   end
   if new_name == target.def_name then
+    vim.notify("masm rename: already named " .. new_name .. "; nothing to do", vim.log.levels.INFO)
     return nil, "same name"
   end
 

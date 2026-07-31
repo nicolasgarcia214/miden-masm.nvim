@@ -192,7 +192,15 @@ function M.refresh(bufnr)
     return
   end
   local stack = require("masm.stack")
-  local result, reason = stack.analyze(bufnr)
+  -- Last-resort containment: this runs from TextChanged/InsertLeave
+  -- autocmds, and one uncaught nil deep in the simulator would otherwise
+  -- become a repeating error notification on every edit. The engine's own
+  -- contract is to return reasons, so tripping this is a bug -- but a
+  -- contained one.
+  local an_ok, result, reason = pcall(stack.analyze, bufnr)
+  if not an_ok then
+    result, reason = nil, "internal analyzer error: " .. tostring(result)
+  end
   if not result then
     -- Unnamed buffer or index failure: clear our output, say why once.
     vim.diagnostic.reset(diag_ns, bufnr)

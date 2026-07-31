@@ -517,6 +517,93 @@ end
 check("order: anonymous cells exempt", not anon_flagged)
 
 ---------------------------------------------------------------------------
+-- engine: one-line bodies and out-of-range positional immediates
+---------------------------------------------------------------------------
+
+-- Body tokens on the declaration line are legal MASM. Events are line-based,
+-- so the engine must refuse such a proc with a reason (never silently
+-- simulate an empty body) -- and its `end` must not be stolen from the NEXT
+-- proc, whose analysis must stay intact.
+vres = analyze_virtual({
+  "#! Invocation: call",
+  "#! Inputs:  [pad(16)]",
+  "#! Outputs: [pad(16)]",
+  "proc oneliner push.1 drop end",
+  "",
+  "#! Invocation: call",
+  "#! Inputs:  [b, a, pad(14)]",
+  "#! Outputs: [a, b, pad(14)]",
+  "proc after_oneliner",
+  "    swap",
+  "end",
+})
+local oneliner, after_oneliner
+for _, p in ipairs(vres and vres.procs or {}) do
+  if p.name == "oneliner" then
+    oneliner = p
+  elseif p.name == "after_oneliner" then
+    after_oneliner = p
+  end
+end
+check(
+  "one-line proc: bailed with a stated reason",
+  oneliner ~= nil and oneliner.bailed ~= nil and oneliner.bailed:find("declaration line") ~= nil,
+  oneliner and tostring(oneliner.bailed) or "proc not scanned"
+)
+check(
+  "one-line proc: own end found, not stolen",
+  oneliner ~= nil and oneliner.end_lnum == 4,
+  oneliner and tostring(oneliner.end_lnum) or "?"
+)
+check(
+  "one-line proc: following proc analyzed cleanly",
+  after_oneliner ~= nil
+    and after_oneliner.bailed == nil
+    and after_oneliner.end_lnum == 11
+    and vres ~= nil
+    and #vres.diagnostics == 0,
+  after_oneliner and (tostring(after_oneliner.bailed) .. "/" .. tostring(after_oneliner.end_lnum))
+    or "proc not scanned"
+)
+
+-- `movup.99` cannot assemble; simulating it would model impossible code (and
+-- in relative mode manufacture a phantom caller draw). Bail like an unknown
+-- mnemonic instead.
+vres = analyze_virtual({
+  "#! Invocation: exec",
+  "#! Inputs:  [a]",
+  "#! Outputs: [a]",
+  "proc bad_index",
+  "    movup.99",
+  "end",
+})
+local bad_index = vres and vres.procs[1]
+check(
+  "positional range: movup.99 bails with a reason",
+  bad_index ~= nil and bad_index.bailed ~= nil and bad_index.bailed:find("2..15", 1, true) ~= nil,
+  bad_index and tostring(bad_index.bailed) or "no proc"
+)
+check(
+  "positional range: no diagnostics from unassemblable code",
+  vres ~= nil and #vres.diagnostics == 0
+)
+
+-- In-range indices keep simulating exactly as before.
+vres = analyze_virtual({
+  "#! Invocation: call",
+  "#! Inputs:  [c, b, a, pad(13)]",
+  "#! Outputs: [a, c, b, pad(13)]",
+  "proc fine_index",
+  "    movup.2",
+  "end",
+})
+check(
+  "positional range: movup.2 still simulated",
+  vres ~= nil and vres.procs[1] ~= nil and vres.procs[1].bailed == nil and #vres.diagnostics == 0,
+  vres and vres.procs[1] and tostring(vres.procs[1].bailed) or "no result"
+)
+
+---------------------------------------------------------------------------
 -- engine: begin..end entrypoint blocks are analyzed (floored, 16-element)
 ---------------------------------------------------------------------------
 
@@ -681,6 +768,29 @@ check(
 )
 stackview.detach(bufnr)
 vim.cmd("edit!") -- drop the injected line so later suites see the fixture as on disk
+
+-- The autocmd-driven pipeline end to end: a TextChanged firing must reach
+-- publish() through the debounce timer (tests above call refresh() directly,
+-- which would mask a broken schedule path).
+vim.g.masm_stack = { debounce_ms = 30 }
+stackview.attach(bufnr)
+stackview.refresh(bufnr)
+local baseline_count = #published()
+vim.api.nvim_buf_set_lines(bufnr, 0, 0, false, { "use miden::core::math::{rusty}" })
+vim.api.nvim_exec_autocmds("TextChanged", { buffer = bufnr })
+local debounced = vim.wait(3000, function()
+  return #published() ~= baseline_count
+end, 20)
+local drift_after = false
+for _, d in ipairs(published()) do
+  if d.code == "unrecognized-import" then
+    drift_after = true
+  end
+end
+check("view: TextChanged autocmd re-publishes via the debounce", debounced and drift_after)
+vim.g.masm_stack = nil
+stackview.detach(bufnr)
+vim.cmd("edit!")
 
 ---------------------------------------------------------------------------
 

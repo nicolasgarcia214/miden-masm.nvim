@@ -8,7 +8,7 @@
 --   crates/masm-instructions/data/instruction_reference.toml
 
 -- stylua: ignore
-return {
+local instructions = {
   { "lte", "c = 1, if a ≤ b, and 0 otherwise.", "(b, a, ...) → (a ≤ b, ...)" },
   { "lte.{n}", "c = 1, if a ≤ {n}, and 0 otherwise.", "(a, ...) → (a ≤ {n}, ...)" },
   { "lt", "c = 1, if a < b, and 0 otherwise.", "(b, a, ...) → (a < b, ...)" },
@@ -177,3 +177,11 @@ return {
   { "trace.{n}", "Emits the trace {n} to the host.", "(...) → (...)" },
   { "log_precompile", "Absorbs a precompile commitment into the transcript used for deferred verification.", "(COMM, TAG, PAD, ...) → (R1, R0, CAP_NEXT, ...)" },
 }
+
+-- Reference gaps (mnemonics the metadata lacks but arity.lua simulates)
+-- are filled from the hand-maintained instructions_extra.lua; the
+-- generator emits this merge, so regeneration cannot lose them.
+for _, e in ipairs(require("masm.instructions_extra")) do
+  instructions[#instructions + 1] = e
+end
+return instructions

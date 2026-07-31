@@ -43,17 +43,21 @@ function M.check()
 
   -- Debugger integration is optional at every level: the module must load,
   -- but missing nvim-dap or backends only mean the feature stays off.
-  local dap_ok, masm_dap = pcall(require, "masm.dap")
+  -- Inspection only -- a health CHECK must not register the adapter or
+  -- create commands as a side effect; registration belongs to the ftplugin.
+  local dap_ok = pcall(require, "masm.dap")
   if not dap_ok then
     health.error("require('masm.dap') failed")
   elseif vim.g.masm_no_dap then
     health.info("debugger integration disabled (vim.g.masm_no_dap is set)")
   else
-    local registered, why = masm_dap.register()
-    if registered then
+    local has_dap, nvim_dap = pcall(require, "dap")
+    if not has_dap then
+      health.info("debugger integration off: nvim-dap is not installed")
+    elseif type(nvim_dap.adapters) == "table" and nvim_dap.adapters.miden then
       health.ok("miden debug adapter registered with nvim-dap (:DapNew, :MasmDapState)")
     else
-      health.info("debugger integration off: " .. why)
+      health.info("miden adapter not registered yet (happens with the first .masm buffer)")
     end
     for _, bin in ipairs({ "miden-debug", "miden-client" }) do
       if vim.fn.executable(bin) == 1 then

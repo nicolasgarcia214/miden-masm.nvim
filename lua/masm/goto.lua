@@ -252,8 +252,18 @@ end
 local function lib_root_file(toml_path, lib)
   local dir = vim.fs.dirname(toml_path)
   local rel = lib.path
-  if rel and (rel:sub(1, 1) == "/" or rel:match("%.%.") or rel:match("^%a:")) then
-    return nil -- absolute or traversing path: refuse the whole library
+  if rel and (rel:sub(1, 1) == "/" or rel:match("^%a:")) then
+    return nil -- absolute path: refuse the whole library
+  end
+  if rel then
+    -- Component-wise, not `rel:match("%.%.")`: a directory legitimately
+    -- named `foo..bar` must not condemn the library; only a real `..`
+    -- component traverses.
+    for comp in rel:gmatch("[^/\\]+") do
+      if comp == ".." then
+        return nil
+      end
+    end
   end
   local candidates = rel and { dir .. "/" .. rel }
     or {
@@ -337,8 +347,15 @@ local function build_index(bufpath, cfg)
 
   -- mod_cache / sym_cache / file_cache memoize module, symbol and per-file
   -- definition lookups; they live on the index so clear_cache() invalidates
-  -- everything at once.
+  -- everything at once. `roots` and `masm_set` exist for _file_written():
+  -- deciding whether a just-saved file is covered-but-unindexed must not
+  -- rescan anything.
   local index = { libs = {}, masm = out.masm, mod_cache = {}, sym_cache = {}, file_cache = {} }
+  index.roots = roots
+  index.masm_set = {}
+  for _, f in ipairs(out.masm) do
+    index.masm_set[f] = true
+  end
   for _, toml in ipairs(out.tomls) do
     local lib = parse_lib_table(toml)
     local root_file = lib_root_file(toml, lib)
@@ -357,6 +374,32 @@ end
 
 function M.clear_cache()
   cache = {}
+end
+
+-- Called from a BufWritePost autocmd (plugin/miden-masm.lua) with the path of
+-- every saved `.masm` file or `miden-project.toml`. The project index caches
+-- the file SET, and without this hook a newly created file stayed invisible
+-- ("gd fails until you somehow know to run :MasmRebuildIndex"). An index is
+-- dropped when the saved file falls under one of its roots and it either is a
+-- manifest (which can redefine a library) or is a .masm file the index has
+-- not seen. Deletions and out-of-editor changes (e.g. git pull) still need
+-- :MasmRebuildIndex.
+function M._file_written(path)
+  if path == "" then
+    return
+  end
+  path = vim.fs.normalize(path)
+  local manifest = vim.fs.basename(path) == "miden-project.toml"
+  for key, index in pairs(cache) do
+    for _, root in ipairs(index.roots) do
+      if path == root or path:sub(1, #root + 1) == root .. "/" then
+        if manifest or not index.masm_set[path] then
+          cache[key] = nil
+        end
+        break
+      end
+    end
+  end
 end
 
 -- Maps a full module path (list of segments) to its .masm file.
@@ -666,8 +709,39 @@ local MAX_REEXPORT_DEPTH = 5
 -- Results are memoized on the index as (def file, def name), never a line
 -- number: the line is re-derived from the freshness-keyed file_interface on
 -- every hit, so edits to the defining file cannot yield stale jump targets.
--- Negative results are cached only for complete (depth-0) searches, so a
--- search truncated by the depth cap cannot poison a later, shallower one.
+-- Each entry also carries the freshness keys of EVERY file the resolution
+-- consulted (the `visited` set), and a hit is honored only while all of them
+-- are unchanged: retargeting a `pub use` in the MIDDLE of a chain, or adding
+-- an export to an intermediate file an earlier search walked through, must
+-- re-resolve -- keying on the origin file alone served stale targets in both
+-- cases. Negative results are cached only for complete (depth-0) searches,
+-- so a search truncated by the depth cap cannot poison a later, shallower
+-- one.
+
+-- The distinct files of a resolution's `visited` set, with their current
+-- freshness keys. Every one of them was consulted, so a change to any can
+-- change the result (an earlier-failing re-export branch may now succeed
+-- and shadow a later one).
+local function visited_deps(visited, index)
+  local deps = {}
+  for vkey in pairs(visited) do
+    local f = vkey:match("^(.-)\1")
+    if f and not deps[f] then
+      deps[f] = file_interface(f, index).key
+    end
+  end
+  return deps
+end
+
+local function deps_fresh(deps, index)
+  for f, k in pairs(deps) do
+    if file_interface(f, index).key ~= k then
+      return false
+    end
+  end
+  return true
+end
+
 local function find_symbol(path, name, index, depth, visited)
   if depth > MAX_REEXPORT_DEPTH then
     return nil
@@ -680,21 +754,18 @@ local function find_symbol(path, name, index, depth, visited)
   visited[key] = depth
 
   local iface = file_interface(path, index)
-  -- Cache entries carry the searched file's freshness key: a string entry is
-  -- a negative result (valid only while that file is unchanged, so "write
-  -- the call site, gd fails, write the proc, gd works" behaves); a table
-  -- entry is { def file, def name, freshness }, re-resolved when the
-  -- searched file changes (a `pub use` line may have been retargeted).
+  -- Cache entries: { neg = true, deps } is a negative result, { def file,
+  -- def name, deps } a positive one. `deps` maps every consulted file to the
+  -- freshness key it had at resolution time; either kind is honored only
+  -- while all of them are unchanged ("write the call site, gd fails, write
+  -- the proc, gd works" behaves, and so does editing any intermediate hop).
   local src = iface.key
   local hit = index.sym_cache[key]
   if hit ~= nil then
-    if type(hit) == "string" then
-      if hit == src then
-        return nil
-      end
+    if not deps_fresh(hit.deps, index) then
       index.sym_cache[key] = nil
-    elseif hit[3] ~= src then
-      index.sym_cache[key] = nil
+    elseif hit.neg then
+      return nil
     else
       local lnum = file_interface(hit[1], index).defs[hit[2]]
       if lnum then
@@ -706,7 +777,7 @@ local function find_symbol(path, name, index, depth, visited)
 
   local lnum = iface.defs[name]
   if lnum then
-    index.sym_cache[key] = { path, name, src }
+    index.sym_cache[key] = { path, name, deps = { [path] = src } }
     return path, lnum, name
   end
   for _, re in ipairs(iface.reexports) do
@@ -716,7 +787,7 @@ local function find_symbol(path, name, index, depth, visited)
         if f then
           local p, l, dn = find_symbol(f, it.orig, index, depth + 1, visited)
           if p then
-            index.sym_cache[key] = { p, dn, src }
+            index.sym_cache[key] = { p, dn, deps = visited_deps(visited, index) }
             return p, l, dn
           end
         end
@@ -724,7 +795,7 @@ local function find_symbol(path, name, index, depth, visited)
     end
   end
   if depth == 0 then
-    index.sym_cache[key] = src
+    index.sym_cache[key] = { neg = true, deps = visited_deps(visited, index) }
   end
 end
 
@@ -998,6 +1069,36 @@ end
 -- References
 ---------------------------------------------------------------------------
 
+-- The set of line numbers covered by selective `use {..} from ..` statements
+-- (which may span lines) in code-only text. Bare tokens on these lines are
+-- import items -- one of the few positions where a symbol is spelled without
+-- an invocation prefix.
+local function selective_use_lines(code)
+  local covered = {}
+  local cur_line, cur_off = 1, 1
+  local function lnum_of(off)
+    while true do
+      local nl = code:find("\n", cur_off, true)
+      if not nl or nl >= off then
+        return cur_line
+      end
+      cur_line = cur_line + 1
+      cur_off = nl + 1
+    end
+  end
+  each_selective_use(code, false, function(stmt)
+    local first = lnum_of(stmt.start)
+    local last = first
+    for _ in code:sub(stmt.start, stmt.stmt_end - 1):gmatch("\n") do
+      last = last + 1
+    end
+    for l = first, last do
+      covered[l] = true
+    end
+  end)
+  return covered
+end
+
 -- Collects every usage in `text` (one file) that resolves to the definition
 -- at (def_path, def_lnum) whose definition-site name is `def_name`. Renamed
 -- re-exports are handled by resolving each candidate, not by name matching.
@@ -1022,10 +1123,16 @@ local function collect_symbol_refs(f, text, def_path, def_lnum, def_name, index,
     end
   end
 
+  local use_lines = selective_use_lines(code_text(text))
   local lnum = 0
   for raw in text:gmatch("([^\n]*)\n?") do
     lnum = lnum + 1
     local line = code_only(raw)
+    -- On `const`/`type` declaration lines, everything right of the `=` is an
+    -- expression over other constants/types (`const C = A + B`,
+    -- `type P = struct { x: Pair }`).
+    local decl_kw = strip_pub(line):match("^(%a+)%f[^%w_]")
+    local decl_eq = (decl_kw == "const" or decl_kw == "type") and line:find("=", 1, true)
     for s, tok in line:gmatch("()([%w_%$:]+)") do
       if tok:find(":") then
         local segs = split_path(tok)
@@ -1041,7 +1148,31 @@ local function collect_symbol_refs(f, text, def_path, def_lnum, def_name, index,
           end
         end
       elseif local_names[tok] then
-        add(f, lnum, s, raw, tok, s)
+        -- A token that merely EQUALS a resolvable name is not a reference:
+        -- Miden's stdlib defines procs named `add`, `and`, `eq`, and the
+        -- bare INSTRUCTION tokens spelling those mnemonics must never be
+        -- collected -- rename would rewrite the opcodes themselves. Count
+        -- the token only in positions where the dialect spells a symbol:
+        --   * after a dot (`exec.add`, `push.MAX`, `mem_load.ADDR`)
+        --   * after `=` (`assert.err=ERR_CODE`), or anywhere right of a
+        --     `const`/`type` declaration's `=`
+        --   * right after the defining keyword (`proc add` -- the site)
+        --   * inside a `use {..} from ..` item list (import references)
+        --   * on an `@attribute(..)` line (attribute arguments)
+        local before = line:sub(1, s - 1)
+        local kw = strip_pub(before):match("^(%a+)%s+$")
+        if
+          before:sub(-1) == "."
+          or before:match("=%s*$")
+          or (decl_eq and s > decl_eq)
+          or kw == "proc"
+          or kw == "const"
+          or kw == "type"
+          or use_lines[lnum]
+          or line:match("^%s*@")
+        then
+          add(f, lnum, s, raw, tok, s)
+        end
       elseif line:sub(1, s - 1):match("([%w_]+)%.$") == "syscall" then
         -- `syscall.name` needs no import; resolve against the kernel library.
         for _, lib in ipairs(index.libs) do
@@ -1124,12 +1255,24 @@ local function reference_target(index, buftext, bufpath)
   return target
 end
 
+-- The loaded buffer whose name is exactly `path`, if any. Deliberately not
+-- `vim.fn.bufnr(path)`: that treats the argument as a file-name PATTERN, so
+-- a path containing `[`, `*` or `,` can match (or fail to match) the wrong
+-- buffer -- and rename's live-buffer-wins guarantee rides on this lookup.
+local function loaded_bufnr(path)
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(b) and vim.api.nvim_buf_get_name(b) == path then
+      return b
+    end
+  end
+end
+
 -- Text for a scanned file: the live buffer when one is loaded (unsaved
 -- edits must win everywhere -- for rename they MUST, or collected positions
 -- would not match the buffer the edit lands in), disk otherwise.
 local function file_text(f)
-  local bufnr = vim.fn.bufnr(f)
-  if bufnr ~= -1 and vim.api.nvim_buf_is_loaded(bufnr) then
+  local bufnr = loaded_bufnr(f)
+  if bufnr then
     return table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
   end
   return read_file(f)
@@ -1172,10 +1315,16 @@ local function run_scan(scan)
 end
 
 local function start_scan(scan)
+  -- Cancel and forget any scan in flight: leaving `active_scan` pointing at
+  -- a cancelled scan (as a sync preemption otherwise would) makes the next
+  -- start_scan "cancel" a corpse.
   if active_scan then
     active_scan.cancelled = true
+    active_scan = nil
   end
-  active_scan = not scan.sync and scan or active_scan
+  if not scan.sync then
+    active_scan = scan
+  end
   scan.i = 1
   scan.errors = 0
   run_scan(scan)
@@ -1311,43 +1460,12 @@ local function valid_ident(name)
   return type(name) == "string" and name:match("^[%a_][%w_]*$") ~= nil
 end
 
--- Renames the symbol under the cursor across the project: the definition,
--- every reference that spells the definition-site name (sites using an `as`
--- alias keep their alias -- that is the correct semantics, the alias still
--- resolves) and the original side of importing/re-exporting use-items.
--- Edits are applied to buffers and left unsaved for review (`:wa` writes
--- them); each buffer's undo history covers its own edits. Synchronous by
--- design: a scan racing user edits could write the new name into positions
--- that no longer hold the old one, and the applied-edit verification below
--- would then skip them.
-function M.rename(new_name)
-  local bufpath = vim.api.nvim_buf_get_name(0)
-  if bufpath == "" then
-    return nil, "unnamed buffer"
-  end
-  local ok, index = pcall(build_index, bufpath, get_config())
-  if not ok then
-    return nil, "indexing failed: " .. tostring(index)
-  end
-  local buftext = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "\n")
-  local target, reason = reference_target(index, buftext, bufpath)
-  if not target then
-    vim.notify("masm rename: " .. reason, vim.log.levels.WARN)
-    return nil, reason
-  end
-  if not target.is_symbol then
-    vim.notify("masm rename: renames procs/consts/types, not modules", vim.log.levels.WARN)
-    return nil, "not a symbol"
-  end
-
-  if new_name == nil then
-    vim.ui.input({ prompt = "Rename " .. target.def_name .. " to: " }, function(input)
-      if input and input ~= "" then
-        M.rename(input)
-      end
-    end)
-    return
-  end
+-- The scan-and-apply half of rename, split from the cursor-resolution half
+-- so the vim.ui.input callback can pass the target CAPTURED at prompt time
+-- (see M.rename). `bufpath` anchors the index build: rooting at the
+-- definition instead would miss the caller's project when the definition
+-- lives in an extra_root.
+local function apply_rename(bufpath, target, new_name)
   if not valid_ident(new_name) then
     vim.notify("masm rename: invalid name " .. vim.inspect(new_name), vim.log.levels.WARN)
     return nil, "invalid name"
@@ -1355,6 +1473,36 @@ function M.rename(new_name)
   if new_name == target.def_name then
     vim.notify("masm rename: already named " .. new_name .. "; nothing to do", vim.log.levels.INFO)
     return nil, "same name"
+  end
+  local ok, index = pcall(build_index, bufpath, get_config())
+  if not ok then
+    return nil, "indexing failed: " .. tostring(index)
+  end
+
+  -- Time (an async prompt, at least) may have passed since the target was
+  -- resolved: verify the definition line still declares that name, or the
+  -- scan below would describe whatever now sits on it.
+  local def_text = file_text(target.def_path) or ""
+  local def_line = vim.split(def_text, "\n")[target.def_lnum] or ""
+  if strip_pub(def_line):match("^%a+%s+([%w_]+)") ~= target.def_name then
+    vim.notify(
+      "masm rename: definition changed since it was resolved; aborted",
+      vim.log.levels.WARN
+    )
+    return nil, "definition moved"
+  end
+  -- Renaming onto an existing sibling definition would silently merge the
+  -- two names (every old-name site would resolve to the survivor).
+  if find_def_line(def_text, new_name) then
+    vim.notify(
+      "masm rename: "
+        .. new_name
+        .. " is already defined in "
+        .. vim.fs.basename(target.def_path)
+        .. "; aborted",
+      vim.log.levels.WARN
+    )
+    return nil, "name collision"
   end
 
   -- Collect edit positions: (file, lnum, 1-based col of the old name).
@@ -1401,8 +1549,12 @@ function M.rename(new_name)
   -- Apply bottom-up so earlier edits cannot shift later positions, verifying
   -- the old name is still at each position (it was collected from this exact
   -- buffer/disk state, so a mismatch means a concurrent change: skip, count).
+  -- 'shortmess' gains `A` for the duration: bufload of a file with a stale
+  -- swap file must not block the whole rename on an interactive prompt.
   local old = target.def_name
   local applied, skipped, file_count = 0, 0, 0
+  local shm = vim.o.shortmess
+  vim.o.shortmess = shm .. "A"
   for f, spots in pairs(edits) do
     table.sort(spots, function(a, b)
       if a[1] ~= b[1] then
@@ -1411,19 +1563,30 @@ function M.rename(new_name)
       return a[2] > b[2]
     end)
     local bufnr = vim.fn.bufadd(f)
-    vim.fn.bufload(bufnr)
-    file_count = file_count + 1
-    for _, s in ipairs(spots) do
-      local lnum, col = s[1], s[2]
-      local line = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)[1] or ""
-      if line:sub(col, col + #old - 1) == old then
-        vim.api.nvim_buf_set_text(bufnr, lnum - 1, col - 1, lnum - 1, col - 1 + #old, { new_name })
-        applied = applied + 1
-      else
-        skipped = skipped + 1
+    if not pcall(vim.fn.bufload, bufnr) then
+      skipped = skipped + #spots
+    else
+      file_count = file_count + 1
+      for _, s in ipairs(spots) do
+        local lnum, col = s[1], s[2]
+        local line = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)[1] or ""
+        if line:sub(col, col + #old - 1) == old then
+          vim.api.nvim_buf_set_text(
+            bufnr,
+            lnum - 1,
+            col - 1,
+            lnum - 1,
+            col - 1 + #old,
+            { new_name }
+          )
+          applied = applied + 1
+        else
+          skipped = skipped + 1
+        end
       end
     end
   end
+  vim.o.shortmess = shm
 
   local msg = ("masm rename: %s -> %s, %d occurrence(s) in %d file(s); buffers left unsaved (:wa to write)"):format(
     old,
@@ -1436,6 +1599,50 @@ function M.rename(new_name)
   end
   vim.notify(msg, skipped > 0 and vim.log.levels.WARN or vim.log.levels.INFO)
   return { applied = applied, skipped = skipped, files = file_count }
+end
+
+-- Renames the symbol under the cursor across the project: the definition,
+-- every reference that spells the definition-site name (sites using an `as`
+-- alias keep their alias -- that is the correct semantics, the alias still
+-- resolves) and the original side of importing/re-exporting use-items.
+-- Edits are applied to buffers and left unsaved for review (`:wa` writes
+-- them); each buffer's undo history covers its own edits. Synchronous by
+-- design: a scan racing user edits could write the new name into positions
+-- that no longer hold the old one, and the applied-edit verification below
+-- would then skip them.
+function M.rename(new_name)
+  local bufpath = vim.api.nvim_buf_get_name(0)
+  if bufpath == "" then
+    return nil, "unnamed buffer"
+  end
+  local ok, index = pcall(build_index, bufpath, get_config())
+  if not ok then
+    return nil, "indexing failed: " .. tostring(index)
+  end
+  local buftext = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "\n")
+  local target, reason = reference_target(index, buftext, bufpath)
+  if not target then
+    vim.notify("masm rename: " .. reason, vim.log.levels.WARN)
+    return nil, reason
+  end
+  if not target.is_symbol then
+    vim.notify("masm rename: renames procs/consts/types, not modules", vim.log.levels.WARN)
+    return nil, "not a symbol"
+  end
+
+  if new_name == nil then
+    -- Pass the target RESOLVED NOW into the callback: vim.ui.input may be
+    -- asynchronous (dressing.nvim, snacks), and by the time it fires the
+    -- cursor can sit on a different symbol -- re-resolving there would
+    -- silently rename that one instead.
+    vim.ui.input({ prompt = "Rename " .. target.def_name .. " to: " }, function(input)
+      if input and input ~= "" then
+        apply_rename(bufpath, target, input)
+      end
+    end)
+    return
+  end
+  return apply_rename(bufpath, target, new_name)
 end
 
 ---------------------------------------------------------------------------
@@ -1502,6 +1709,10 @@ end
 -- Bounded, symlink/FIFO-safe file read, shared with masm.hover so hovers
 -- honor the same untrusted-input rules as the index. Not public API.
 M._read_file = read_file
+
+-- Exact-name loaded-buffer lookup, shared with masm.hover so hovers prefer
+-- live text by the same rule scans do. Not public API.
+M._loaded_bufnr = loaded_bufnr
 
 -- Comment/string blanking and cache freshness keys, shared with masm.stack so
 -- the analyzer scans code and invalidates caches by exactly the same rules as
@@ -1635,7 +1846,15 @@ function M.tagfunc(pattern, flags, _)
       return {}
     end
     local mods, syms = parse_imports(buftext)
-    item, reason = resolve_path(segs, #segs, nil, mods, syms, buftext, bufpath, index)
+    -- pcall like the cursor branch: an internal error must surface as "no
+    -- tag found", not escape raw into the tag machinery.
+    local res_ok
+    res_ok, item, reason =
+      pcall(resolve_path, segs, #segs, nil, mods, syms, buftext, bufpath, index)
+    if not res_ok then
+      vim.notify("masm goto: " .. tostring(item), vim.log.levels.ERROR)
+      return {}
+    end
   end
 
   if item then

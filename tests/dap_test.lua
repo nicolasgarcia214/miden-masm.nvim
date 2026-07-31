@@ -85,11 +85,11 @@ check(
 -- _start_adapter: readiness, early exit, timeout, missing binary
 ---------------------------------------------------------------------------
 
-local function wait_result(spec_arg, timeout_ms)
+local function wait_result(spec_arg, timeout_ms, key)
   local result = "pending"
   dap._start_adapter(spec_arg, function(err)
     result = err or "ready"
-  end, timeout_ms)
+  end, timeout_ms, key)
   vim.wait(5000, function()
     return result ~= "pending"
   end, 10)
@@ -102,6 +102,33 @@ local res = wait_result({
 })
 check("adapter: readiness line detected", res == "ready", tostring(res))
 dap._kill()
+
+-- Pipes must stay open and drained past readiness: closing them at the
+-- handshake gave the backend dead write ends, and a single post-handshake
+-- log line (Rust panics on println! EPIPE) killed live sessions.
+res = wait_result({
+  cmd = "sh",
+  args = { "-c", 'echo "DAP server listening"; sleep 0.3; echo post-ready-output; sleep 5' },
+})
+check("adapter: ready before post-ready output", res == "ready", tostring(res))
+local drained = vim.wait(3000, function()
+  return table.concat(dap._last_output):find("post-ready-output", 1, true) ~= nil
+end, 50)
+check("adapter: pipes drained after readiness", drained)
+dap._kill()
+
+-- Concurrent backends: keyed by port, killing one leaves the other running.
+local ready_spec = { cmd = "sh", args = { "-c", 'echo "DAP server listening"; sleep 5' } }
+check("adapter: first keyed backend ready", wait_result(ready_spec, nil, 1001) == "ready")
+check("adapter: second keyed backend ready", wait_result(ready_spec, nil, 1002) == "ready")
+check("adapter: both children tracked", dap._children[1001] ~= nil and dap._children[1002] ~= nil)
+dap._kill(1001)
+check(
+  "adapter: killing one child spares the other",
+  dap._children[1001] == nil and dap._children[1002] ~= nil
+)
+dap._kill()
+check("adapter: kill-all clears the table", next(dap._children) == nil)
 
 res = wait_result({ cmd = "sh", args = { "-c", "echo nope; exit 3" } })
 check(

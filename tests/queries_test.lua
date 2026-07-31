@@ -46,6 +46,31 @@ for _, qname in ipairs({ "highlights", "indents", "folds", "locals", "textobject
   end
 end
 
+-- locals must be actionable, not scopes-only: definition and reference
+-- captures both fire on the fixtures (regression: the file shipped inert,
+-- with nothing for a consumer to link).
+do
+  local src = read(plugin_root .. "/queries/masm/locals.scm")
+  local ok, query = pcall(vim.treesitter.query.parse, "masm", src)
+  local kinds = {}
+  if ok then
+    for _, text in ipairs(sources) do
+      local parser = vim.treesitter.get_string_parser(text, "masm")
+      local tree = parser:parse()[1]
+      for id in query:iter_captures(tree:root(), text) do
+        local name = query.captures[id]
+        kinds[name:match("^[%w]+%.[%w]+")] = true
+      end
+    end
+  end
+  if ok and kinds["local.definition"] and kinds["local.reference"] and kinds["local.scope"] then
+    print("PASS: locals has scope, definition and reference captures")
+  else
+    print("FAIL: locals lacks definition/reference captures: " .. vim.inspect(kinds))
+    failed = failed + 1
+  end
+end
+
 print(failed == 0 and "ALL PASS" or (failed .. " FAILURES"))
 if failed > 0 then
   os.exit(1)

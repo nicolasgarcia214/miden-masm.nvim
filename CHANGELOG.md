@@ -25,19 +25,6 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/).
   plus `:MasmDapState` showing the VM cycle, operand stack and call stack
   from the `miden/uiState` event. Inert without nvim-dap; opt out with
   `vim.g.masm_no_dap`.
-- Order-aware stack comment checking (`comment-reordered`): a `# => [...]`
-  comment listing exactly the simulated stack's named elements in a
-  different order is flagged -- the swapped-operands documentation bug that
-  width checking cannot see. Renamed or anonymous elements can never trip
-  it.
-- Dialect-drift canary (`unrecognized-import`): `use` statements matching
-  none of the resolver's known forms are published as diagnostics, so a
-  future dialect change degrades loudly instead of silently.
-- `begin..end` entrypoint blocks are analyzed: they enter on the 16-element
-  physical stack (declared `#! Inputs:` named and zero-padded), trackers
-  and branches are checked like any procedure, and a program ending deeper
-  than 16 is an error (the VM caps stack outputs at 16).
-
 - Static stack analysis: a per-instruction operand-stack simulator publishes
   `vim.diagnostic` errors when a `call`-invoked procedure would return at a
   stack depth other than the mandatory 16 (the VM rejects every such call at
@@ -50,11 +37,44 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/).
   from the callees' declared stack contracts through the existing project
   index; procedures that cannot be analyzed are skipped with a stated
   reason, never guessed at.
+- Order-aware stack comment checking (`comment-reordered`): a `# => [...]`
+  comment listing exactly the simulated stack's named elements in a
+  different order is flagged -- the swapped-operands documentation bug that
+  width checking cannot see. Renamed or anonymous elements can never trip
+  it.
+- `begin..end` entrypoint blocks are analyzed: they enter on the 16-element
+  physical stack (declared `#! Inputs:` named and zero-padded), trackers
+  and branches are checked like any procedure, and a program ending deeper
+  than 16 is an error (the VM caps stack outputs at 16).
+- Dialect-drift canary (`unrecognized-import`): `use` statements matching
+  none of the resolver's known forms are published as diagnostics, so a
+  future dialect change degrades loudly instead of silently.
 - `K` hover documentation: the definition's `#!` doc comment, `@` attributes
   and signature (resolved exactly like `gd`, so renamed imports and
   re-exports work), module doc blocks on qualifiers, and description plus
   stack effect for bare opcodes from the bundled Miden instruction
   reference. A second `K` focuses the float.
+- The project index refreshes automatically when a new `.masm` file or a
+  `miden-project.toml` is saved from Neovim; `:MasmRebuildIndex` is only
+  needed for deletions, moves and out-of-editor changes.
+- Rename refuses a new name already defined in the definition's file
+  (renaming onto it would silently merge the two symbols), and re-verifies
+  the definition before applying when the name came from an asynchronous
+  `vim.ui.input` prompt (the target is captured at prompt time, so a moved
+  cursor cannot redirect the rename).
+- Locals query (`queries/masm/locals.scm`) now carries
+  `@local.definition.*` and `@local.reference` captures (procedure,
+  constant and type names; invocation paths and constant immediates) in
+  addition to the upstream scopes, so locals-aware consumers have something
+  to act on.
+- Hand-maintained instruction reference entries
+  (`lua/masm/instructions_extra.lua`) for mnemonics the generated masm-lsp
+  snapshot lacks (`eqz`, `nop`, `breakpoint`, `adv_pushw`, `reversew`,
+  `reversedw`, plain `mem_loadw`/`mem_storew`/`loc_loadw`/`loc_storew`,
+  and the `u32widening_*` family), so hover and completion know every
+  instruction the stack analyzer simulates; a consistency test keeps the
+  arity table, instruction reference and highlight keyword list in
+  agreement from now on.
 
 ### Changed
 
@@ -64,9 +84,46 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/).
   blocking behavior and returns the items.
 - References and rename scans read the live text of every loaded buffer,
   not just the current one, so unsaved edits elsewhere are seen.
+- Concurrent debug sessions: each launch's backend is tracked by its DAP
+  port, a session's end kills only its own backend, and backend
+  stdout/stderr stay drained for the process's lifetime (closing them at
+  the readiness handshake could kill Rust backends with an EPIPE panic on
+  their first post-handshake log line).
+- `:checkhealth masm` is now a pure inspection: it reports whether the DAP
+  adapter is registered instead of registering it as a side effect.
+- The stack analyzer refuses (with a stated reason) positional indices the
+  assembler rejects (`movup.99`) and procedures whose body tokens share
+  the declaration line, instead of simulating them wrongly; one-line
+  procedures no longer steal the following procedure's `end` during
+  scanning. Diagnostics sort deterministically on ties.
 
 ### Fixed
 
+- References and rename no longer treat bare instruction tokens as
+  references to same-named procedures: with a proc named after an opcode
+  (Miden's `std::math::u64` defines `add`, `and`, `eq`), rename rewrote
+  the instruction tokens themselves, silently corrupting the program. Bare
+  names now count only in symbol positions (after invocation/immediate
+  dots, `=`, declaration keywords, inside `use { .. }` lists, on
+  attribute lines and in `const`/`type` expressions).
+- Re-export chain resolutions are freshness-keyed on every file the lookup
+  consulted, so retargeting a `pub use` in the middle of a chain (or
+  adding a definition an earlier search missed) re-resolves immediately
+  instead of serving the cached destination until `:MasmRebuildIndex`.
+- Hover: the cursor sitting on the dot of an unresolvable dotted operand
+  no longer shows the mnemonic family's docs (off-by-one in the
+  mnemonic-boundary check), and definitions open modified in another
+  buffer hover their live text instead of the stale disk state.
+- Completion: `exp.u{n}` was silently dropped from opcode candidates (the
+  template collapse required a dot before the placeholder); it is offered
+  as `exp.u` now.
+- Scans look buffers up by exact name instead of `bufnr()`'s file-name
+  pattern matching, which could mismatch paths containing `[`, `*` or `,`.
+- `:tag`-style tagfunc calls wrap resolution in `pcall` like the cursor
+  path, so an internal error reports instead of escaping into the tag
+  machinery; rename guards `bufload` against swap-file prompts; a library
+  directory literally named `foo..bar` is no longer refused by the
+  manifest path-traversal check (components are checked, not substrings).
 - `gd` on the `exec`/`call` keyword of a qualified invocation
   (`exec.math::add`) jumped to the module file instead of the invoked
   procedure; the retargeted token now resolves its final segment.

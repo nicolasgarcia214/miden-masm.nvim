@@ -534,6 +534,260 @@ check(
 )
 
 -- ------------------------------------------------------------------------
+-- Opcode-named procs: bare instruction tokens are not references
+-- ------------------------------------------------------------------------
+
+local function restore_modified_buffers()
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(b) and vim.bo[b].modified then
+      vim.api.nvim_buf_call(b, function()
+        vim.cmd("edit!")
+      end)
+    end
+  end
+end
+
+place("app/opcodes.masm", "proc add", 5)
+refs = goto_mod.references({ sync = true }) or {}
+close_lists()
+check("opcode-named: exactly def + exec site, no bare opcodes", #refs == 2, "got " .. #refs)
+check("opcode-named: definition found", has_ref(refs, "app/opcodes.masm", "proc add"))
+check("opcode-named: exec.add found", has_ref(refs, "app/opcodes.masm", "exec.add"))
+
+place("app/opcodes.masm", "proc add", 5)
+res, why = goto_mod.rename("checked_sum")
+check(
+  "opcode-named rename: exactly 2 edits",
+  res ~= nil and res.applied == 2 and res.skipped == 0,
+  res ~= nil and vim.inspect(res) or tostring(why)
+)
+local opcodes_text = buffer_text_of("app/opcodes.masm")
+check(
+  "opcode-named rename: instruction tokens untouched",
+  opcodes_text:find("push.1 add", 1, true) ~= nil
+    and opcodes_text:find("push.2 add drop", 1, true) ~= nil
+)
+check(
+  "opcode-named rename: definition and call renamed",
+  opcodes_text:find("proc checked_sum", 1, true) ~= nil
+    and opcodes_text:find("exec.checked_sum", 1, true) ~= nil
+)
+restore_modified_buffers()
+
+-- Renaming onto an existing sibling definition would silently merge the two
+-- names; it must refuse instead.
+place("app/main.masm", "push.MAX_VALUE", 5)
+local col_res, col_why = goto_mod.rename("ERR_OVERFLOW")
+check(
+  "rename: refuses collision with an existing definition",
+  col_res == nil and col_why == "name collision",
+  tostring(col_why)
+)
+
+-- Async-prompt capture: with a vim.ui.input that moves the cursor before
+-- submitting (what an async dressing/snacks prompt amounts to), the symbol
+-- captured at prompt time is renamed -- not whatever the cursor lands on.
+local saved_input = vim.ui.input
+vim.ui.input = function(_, cb)
+  place("app/main.masm", "push.MAX_VALUE", 5)
+  cb("PROMPTED_LIMIT")
+end
+place("app/main.masm", "push.LOCAL_LIMIT", 5)
+goto_mod.rename()
+vim.ui.input = saved_input
+main_text = buffer_text_of("app/main.masm")
+check(
+  "rename prompt: captured target renamed, cursor-at-callback ignored",
+  main_text:find("const PROMPTED_LIMIT", 1, true) ~= nil
+    and main_text:find("push.PROMPTED_LIMIT", 1, true) ~= nil
+    and main_text:find("push.MAX_VALUE", 1, true) ~= nil
+)
+restore_modified_buffers()
+
+-- ------------------------------------------------------------------------
+-- Re-export chain invalidation: editing a MIDDLE hop re-resolves
+-- ------------------------------------------------------------------------
+
+-- wrappers::LIMIT resolves main.masm -> wrappers.masm (pub use) ->
+-- math.masm MAX_VALUE. Retargeting the middle hop on disk must serve the
+-- new destination on the very next jump, without :MasmRebuildIndex. The
+-- tracked fixture is mutated on disk, so everything between the write and
+-- the restore runs under pcall.
+local wr_path = root .. "std_lib/wrappers.masm"
+local wfh = assert(io.open(wr_path, "r"))
+local orig_wr = wfh:read("*a")
+wfh:close()
+place("app/main.masm", "wrappers::LIMIT", 11)
+local chain_before = goto_mod.tagfunc("", "c", {})
+local chain_ok, chain_after = pcall(function()
+  local w = assert(io.open(wr_path, "w"))
+  w:write((orig_wr:gsub("MAX_VALUE as LIMIT", "ERR_OVERFLOW as LIMIT")))
+  w:close()
+  return goto_mod.tagfunc("", "c", {})
+end)
+local wrestore = assert(io.open(wr_path, "w"))
+wrestore:write(orig_wr)
+wrestore:close()
+chain_after = chain_ok and chain_after or {}
+local retargeted_line = ""
+if chain_after[1] then
+  local mfh = assert(io.open(chain_after[1].filename, "r"))
+  local mlines = {}
+  for l in mfh:lines() do
+    table.insert(mlines, l)
+  end
+  mfh:close()
+  retargeted_line = mlines[tonumber(chain_after[1].cmd)] or ""
+end
+check(
+  "chain retarget: middle-hop edit re-resolves without :MasmRebuildIndex",
+  chain_ok and chain_before[1] ~= nil and retargeted_line:find("ERR_OVERFLOW", 1, true) ~= nil,
+  "landed on: " .. retargeted_line
+)
+
+-- ------------------------------------------------------------------------
+-- Index auto-refresh: files created after the first jump become visible
+-- once the BufWritePost hook reports them
+-- ------------------------------------------------------------------------
+
+local new_path = root .. "app/created_later.masm"
+place("app/main.masm", "push.MAX_VALUE", 5)
+local before_refs = goto_mod.references({ sync = true }) or {}
+close_lists()
+local refresh_ok, refresh_err = pcall(function()
+  local w = assert(io.open(new_path, "w"))
+  w:write("use {MAX_VALUE} from fix::core::math\n\nproc late\n    push.MAX_VALUE drop\nend\n")
+  w:close()
+  place("app/main.masm", "push.MAX_VALUE", 5)
+  local stale_refs = goto_mod.references({ sync = true }) or {}
+  close_lists()
+  check(
+    "index refresh: new file invisible before the write hook",
+    #stale_refs == #before_refs,
+    ("stale %d vs before %d"):format(#stale_refs, #before_refs)
+  )
+  goto_mod._file_written(new_path)
+  place("app/main.masm", "push.MAX_VALUE", 5)
+  local fresh_refs = goto_mod.references({ sync = true }) or {}
+  close_lists()
+  check(
+    "index refresh: new file's references appear after the hook",
+    #fresh_refs == #before_refs + 2,
+    ("fresh %d vs before %d"):format(#fresh_refs, #before_refs)
+  )
+end)
+os.remove(new_path)
+goto_mod.clear_cache() -- the removed file must not linger in later suites
+check("index refresh: block completed", refresh_ok, tostring(refresh_err))
+
+-- ------------------------------------------------------------------------
+-- Configuration surface: extra_roots, ignore_dirs, string-as-list
+-- ------------------------------------------------------------------------
+
+-- extra_roots: a library OUTSIDE the project tree resolves once listed.
+local ext_root = vim.fn.tempname()
+vim.fn.mkdir(ext_root .. "/extlib", "p")
+local config_ok, config_err = pcall(function()
+  local w = assert(io.open(ext_root .. "/extlib/miden-project.toml", "w"))
+  w:write('[lib]\nnamespace = "ext::lib"\npath = "extlib.masm"\n')
+  w:close()
+  w = assert(io.open(ext_root .. "/extlib/extlib.masm", "w"))
+  w:write("#! External fixture library.\npub proc ext_proc\n    push.1 drop\nend\n")
+  w:close()
+
+  vim.cmd("edit! " .. root .. "app/main.masm")
+  goto_mod.clear_cache()
+  local miss = goto_mod.tagfunc("ext::lib::ext_proc", "", {})
+  check("extra_roots: external lib unknown without config", miss ~= vim.NIL and #miss == 0)
+
+  vim.g.masm_goto = { extra_roots = { ext_root } }
+  goto_mod.clear_cache()
+  local hit = goto_mod.tagfunc("ext::lib::ext_proc", "", {})
+  check(
+    "extra_roots: external lib resolves with config",
+    hit ~= vim.NIL and hit[1] ~= nil and hit[1].filename:find("extlib.masm", 1, true) ~= nil,
+    vim.inspect(hit)
+  )
+
+  -- A bare string is accepted as a one-element list, for both options.
+  vim.g.masm_goto = { extra_roots = ext_root }
+  goto_mod.clear_cache()
+  hit = goto_mod.tagfunc("ext::lib::ext_proc", "", {})
+  check(
+    "extra_roots: string accepted as one-element list",
+    hit ~= vim.NIL and hit[1] ~= nil,
+    vim.inspect(hit)
+  )
+
+  -- ignore_dirs REPLACES the default list; an ignored directory's files
+  -- disappear from scans (std_lib holds the re-export fixture).
+  vim.g.masm_goto = { ignore_dirs = { "std_lib", "target", "node_modules" } }
+  goto_mod.clear_cache()
+  place("app/main.masm", "push.MAX_VALUE", 5)
+  local ignored_refs = goto_mod.references({ sync = true }) or {}
+  close_lists()
+  check(
+    "ignore_dirs: ignored directory's references vanish",
+    not has_ref(ignored_refs, "std_lib/wrappers.masm", nil),
+    tostring(#ignored_refs)
+  )
+end)
+vim.g.masm_goto = nil
+goto_mod.clear_cache()
+vim.fn.delete(ext_root, "rf")
+check("config surface: block completed", config_ok, tostring(config_err))
+
+-- ------------------------------------------------------------------------
+-- Resolver limits: re-export depth cap and cycle detection
+-- ------------------------------------------------------------------------
+
+-- Chains resolve through MAX_REEXPORT_DEPTH (5) hops and report "not found"
+-- one hop deeper; cycles fail cleanly. Fixture chains are created on disk
+-- and removed afterwards, so everything in between runs under pcall.
+local chain_files = {}
+local function write_chain(name, text)
+  local path = root .. "app/" .. name
+  chain_files[#chain_files + 1] = path
+  local w = assert(io.open(path, "w"))
+  w:write(text)
+  w:close()
+end
+local limits_ok, limits_err = pcall(function()
+  for i = 1, 5 do
+    write_chain(("hop%d.masm"):format(i), ("pub use {deep_ok} from hop%d\n"):format(i + 1))
+  end
+  write_chain("hop6.masm", "pub proc deep_ok\n    push.1 drop\nend\n")
+  for i = 1, 6 do
+    write_chain(("far%d.masm"):format(i), ("pub use {deep_bad} from far%d\n"):format(i + 1))
+  end
+  write_chain("far7.masm", "pub proc deep_bad\n    push.1 drop\nend\n")
+  write_chain("cyc1.masm", "pub use {spin} from cyc2\n")
+  write_chain("cyc2.masm", "pub use {spin} from cyc1\n")
+  goto_mod.clear_cache()
+  vim.cmd("edit! " .. root .. "app/main.masm")
+
+  local deep = goto_mod.tagfunc("hop1::deep_ok", "", {})
+  check(
+    "limits: 5-hop re-export chain resolves",
+    deep ~= vim.NIL and deep[1] ~= nil and deep[1].filename:find("hop6.masm", 1, true) ~= nil,
+    vim.inspect(deep)
+  )
+  local far = goto_mod.tagfunc("far1::deep_bad", "", {})
+  check("limits: 6-hop chain reports not found", far ~= vim.NIL and #far == 0, vim.inspect(far))
+  local cyc_ok, cyc = pcall(goto_mod.tagfunc, "cyc1::spin", "", {})
+  check(
+    "limits: re-export cycle fails cleanly",
+    cyc_ok and cyc ~= vim.NIL and #cyc == 0,
+    tostring(cyc)
+  )
+end)
+for _, f in ipairs(chain_files) do
+  os.remove(f)
+end
+goto_mod.clear_cache()
+check("resolver limits: block completed", limits_ok, tostring(limits_err))
+
+-- ------------------------------------------------------------------------
 -- Dialect-drift canary: unrecognized use-statement forms are reported
 -- ------------------------------------------------------------------------
 

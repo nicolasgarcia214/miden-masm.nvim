@@ -22,6 +22,23 @@ vim.g.loaded_miden_masm = 1
 -- no-op on 0.11+ (same extension, same filetype).
 vim.filetype.add({ extension = { masm = "masm" } })
 
+-- Keep the goto project index honest about the file SET: it caches which
+-- .masm files and manifests exist, and a file created after the first jump
+-- would otherwise stay invisible until :MasmRebuildIndex. Saving a .masm
+-- file the index has not seen (or any manifest) drops the affected index;
+-- masm.goto is only consulted when already loaded -- this must not pull the
+-- whole resolver in just because some .masm file got written.
+vim.api.nvim_create_autocmd("BufWritePost", {
+  pattern = { "*.masm", "miden-project.toml" },
+  group = vim.api.nvim_create_augroup("miden_masm_index", { clear = true }),
+  callback = function(ev)
+    local goto_mod = package.loaded["masm.goto"]
+    if goto_mod then
+      goto_mod._file_written(vim.api.nvim_buf_get_name(ev.buf))
+    end
+  end,
+})
+
 vim.api.nvim_create_autocmd("User", {
   pattern = "TSUpdate",
   group = vim.api.nvim_create_augroup("miden_masm_parser", { clear = true }),

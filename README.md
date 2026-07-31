@@ -135,7 +135,10 @@ All mappings are buffer-local to `.masm` files:
 - `grn` or `:MasmRename [name]` - rename the symbol under the cursor
   project-wide. Edits are applied to buffers and left unsaved for review
   (`:wa` writes them, or undo per buffer). Sites importing the symbol under
-  an `as` alias keep their alias -- it still resolves.
+  an `as` alias keep their alias -- it still resolves. Renaming onto a name
+  already defined in the same file is refused (it would silently merge the
+  two symbols), and procs named after opcodes never drag bare instruction
+  tokens into the edit.
 - `<C-x><C-o>` (insert mode) - complete invocation targets, constants and
   opcodes from the same index navigation uses; proc candidates show their
   `[inputs] -> [outputs]` contract, opcodes their stack effect.
@@ -257,9 +260,9 @@ Honest list, so you know what you are getting:
 - `std::` / `miden::core::` targets need `extra_roots` (see above), since
   those sources ship with miden-vm, not with user projects.
 - Re-export chains are followed up to 5 hops; deeper chains report "not
-  found". Cyclic chains are detected and fail cleanly. Retargeting a
-  `pub use` line in the middle of a 3+ hop chain can keep serving the old
-  destination for already-resolved names until `:MasmRebuildIndex`. A
+  found". Cyclic chains are detected and fail cleanly. Resolution results
+  are freshness-keyed on every file the lookup consulted, so editing any
+  hop of a chain (including the middle) re-resolves on the next jump. A
   multi-line `use { .. } from` block longer than 40 lines is not recognized
   from inside its braces.
 - The first jump builds the project index synchronously (one bounded
@@ -271,14 +274,16 @@ Honest list, so you know what you are getting:
   spellings (`use { x as y }`) keep their alias, and generated code or
   docs outside `.masm` files are not touched.
 - Definition positions are re-read whenever a file's mtime changes, so
-  ordinary edit-and-save cycles are picked up automatically. The project
-  index itself (which files and libraries exist) refreshes only on
-  `:MasmRebuildIndex`, so run that after creating, deleting or moving
-  `.masm` files or `miden-project.toml` manifests.
+  ordinary edit-and-save cycles are picked up automatically, and saving a
+  new `.masm` file or a `miden-project.toml` from Neovim refreshes the
+  project index itself. Deleting or moving files, and changes made outside
+  Neovim (`git pull`), still need `:MasmRebuildIndex`.
 - Hover shows what the definition site says (doc comment, signature). The
   bundled instruction reference is generated from Trail of Bits'
   [masm-lsp](https://github.com/trailofbits/masm-lsp) metadata and pins that
-  snapshot of the Miden docs.
+  snapshot of the Miden docs, plus hand-maintained entries for mnemonics the
+  snapshot lacks -- a consistency test keeps every instruction the stack
+  analyzer simulates documented in hover/completion too.
 - Stack analysis is a static approximation, not the assembler: absence of
   diagnostics is not a correctness proof. Procedures without a
   `#! Invocation:` doc tag (or a script attribute with a padded 16-element
@@ -296,7 +301,8 @@ Honest list, so you know what you are getting:
   only when both the comment and the simulation are fully named with
   matching name multisets -- renamed elements in the wrong order remain
   invisible. An unknown instruction skips the whole procedure with a stated
-  reason rather than guessing.
+  reason rather than guessing -- as do a positional index the assembler
+  rejects (`movup.99`) and body tokens sharing the `proc` declaration line.
 - Debugging requires nvim-dap and miden-debug / miden-client builds that
   support `--start-debug-adapter`.
 - No assembler diagnostics beyond stack analysis and the import canary. For

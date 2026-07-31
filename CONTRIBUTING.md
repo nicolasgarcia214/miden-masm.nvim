@@ -21,21 +21,29 @@ make test          # navigation test suite (no network needed)
 make test-queries  # builds the pinned grammar, validates the queries
 ```
 
-`make test` runs six suites headlessly (`nvim --headless --clean`):
-`tests/masm_test.lua` (navigation, references sync and async, rename, the
-dialect-drift canary), `tests/hover_test.lua`, `tests/stack_test.lua`
-(stack-list notation, instruction arities, the stack simulator including
-order-aware comment checking, and its UI) and `tests/complete_test.lua`
-(omnifunc contexts) against the fixture project in `tests/fixtures/`,
-which is a miniature Miden workspace -- two namespaced libraries, a renamed
-re-export chain, a kernel library, a single-file account component and an
-adversarial fixture; `tests/fixtures/app/stack.masm` ports the real
-min_burn_amount depth-17 bug as a regression pair -- plus
-`tests/dap_test.lua` (launch argv, port fallback and the spawn/readiness
-protocol against stub processes; nvim-dap registration against a stub
-module) and `tests/ftplugin_test.lua` for filetype detection and the
-ftplugin's setup/teardown. No Miden checkout, Miden binaries or network
-access are needed, and each suite exits non-zero on failure.
+`make test` runs eight suites headlessly (`nvim --headless --clean`):
+`tests/masm_test.lua` (navigation, references sync and async, rename
+including opcode-named procs and collision refusal, index auto-refresh,
+re-export chain invalidation, config surface, resolver limits, the
+dialect-drift canary), `tests/hover_test.lua` (content and the float
+layer), `tests/stack_test.lua` (stack-list notation, instruction arities,
+the stack simulator including order-aware comment checking, one-line-body
+and immediate-range bails, and its UI incl. the autocmd pipeline) and
+`tests/complete_test.lua` (omnifunc contexts) against the fixture project
+in `tests/fixtures/`, which is a miniature Miden workspace -- two
+namespaced libraries, a renamed re-export chain, a kernel library, a
+single-file account component and an adversarial fixture;
+`tests/fixtures/app/stack.masm` ports the real min_burn_amount depth-17
+bug as a regression pair -- plus `tests/dap_test.lua` (launch argv, port
+fallback, the spawn/readiness protocol and pipe draining against stub
+processes; per-port child tracking; nvim-dap registration against a stub
+module), `tests/health_test.lua` (`:checkhealth masm` against stubbed
+reporters, including that the check never mutates state),
+`tests/consistency_test.lua` (the arity table, instruction reference and
+highlight keyword list must agree -- see below) and
+`tests/ftplugin_test.lua` for filetype detection and the ftplugin's
+setup/teardown. No Miden checkout, Miden binaries or network access are
+needed, and each suite exits non-zero on failure.
 
 `make test-queries` clones and compiles the pinned tree-sitter-masm revision
 (network + C compiler required), then asserts each query in `queries/masm/`
@@ -69,13 +77,18 @@ fixtures can evolve.
 - `lua/masm/arity.lua` - HAND-AUDITED instruction arities. Not generated:
   the prose stack effects in `instructions.lua` carry arity errors. Add new
   instructions here AND to the corpus vocabulary list in
-  `tests/stack_test.lua`.
+  `tests/stack_test.lua`; `tests/consistency_test.lua` will then insist the
+  instruction reference and the highlight keyword list know them too (fill
+  reference gaps in `instructions_extra.lua`).
 - `lua/masm/stackview.lua` - stack-analysis UI: diagnostics publishing,
   ghost-text overlay, debounce, attach/detach.
 - `lua/masm/instructions.lua` - GENERATED instruction metadata; do not edit.
   Regenerate with `scripts/gen_instructions.py` against a
   [masm-lsp](https://github.com/trailofbits/masm-lsp) checkout when Miden
-  adds or changes instructions.
+  adds or changes instructions. Hand-written entries for mnemonics the
+  metadata lacks go in `lua/masm/instructions_extra.lua`, which the
+  generated file appends at load time (regeneration cannot lose them);
+  `tests/consistency_test.lua` flags entries that become redundant.
 - `lua/masm/health.lua` - `:checkhealth masm`.
 - `after/ftplugin/masm.lua` - buffer-local settings, keymaps, commands. In
   `after/` because it corrects Neovim's built-in `masm` (Microsoft

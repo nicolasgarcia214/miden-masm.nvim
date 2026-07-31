@@ -95,11 +95,12 @@ gO                 List the buffer's definitions (procs, consts, types,
 
                                                             *:MasmRebuildIndex*
 :MasmRebuildIndex  Drop the cached project index and resolution caches. The
-                   index rebuilds on the next jump. Use after adding,
-                   deleting or moving `.masm` files or `miden-project.toml`
-                   manifests, or after changing |g:masm_goto|. Plain edits to
-                   existing files do not need this: definition positions are
-                   re-read whenever a file's mtime changes.
+                   index rebuilds on the next jump. Rarely needed: plain
+                   edits are picked up via file mtimes, and saving a new
+                   `.masm` file or a `miden-project.toml` from Neovim
+                   refreshes the index automatically. Use it after deleting
+                   or moving files, after changes made outside Neovim (e.g.
+                   `git pull`), or after changing |g:masm_goto|.
 
                                                                  *:MasmRename*
 :MasmRename [name] Rename the symbol under the cursor across the project
@@ -110,8 +111,17 @@ gO                 List the buffer's definitions (procs, consts, types,
                    use an `as` alias keep their alias, which still resolves.
                    Edits are applied to buffers and left unsaved for review
                    -- inspect with |:ls|, write with |:wa|, or undo per
-                   buffer. Modules cannot be renamed (their name is a file
-                   name).
+                   buffer. Renaming onto a name already defined in the
+                   definition's file is refused (it would silently merge the
+                   two symbols), as are invalid identifiers. The prompt
+                   captures the symbol under the cursor at prompt time, so
+                   an asynchronous |vim.ui.input| implementation cannot
+                   rename whatever the cursor later moved to. Bare
+                   instruction tokens are never rename targets: a procedure
+                   named after an opcode (Miden's std::math::u64 defines
+                   `add`, `and`, `eq`) does not drag the opcodes themselves
+                   into the rename. Modules cannot be renamed (their name is
+                   a file name).
 
                                                             *:MasmStackToggle*
 :MasmStackToggle   Toggle the inferred-stack ghost-text overlay for the
@@ -164,9 +174,9 @@ itself. Codes:
                            returns at a stack depth other than 16. The VM
                            rejects every invocation of such a procedure at
                            runtime (`InvalidStackDepthOnReturn`).
-  abi-16            ERROR  An `Invocation: call`/`dyncall` procedure declares
-                           `Inputs:`/`Outputs:` that do not sum to the
-                           mandatory 16 elements.
+  abi-16            ERROR  An `Invocation: call`/`syscall`/`dyncall`
+                           procedure declares `Inputs:`/`Outputs:` that do
+                           not sum to the mandatory 16 elements.
   comment-stale     WARN   A handwritten `# => [...]` comment disagrees with
                            the simulated stack width at that point.
   comment-reordered WARN   A handwritten comment lists exactly the same
@@ -212,7 +222,11 @@ groups: `MasmStackVirtualText` (links to `NonText`) and
 Analysis runs on |InsertLeave| and normal-mode edits (debounced) and on
 every write, whole-buffer, synchronously and bounded: oversized buffers,
 per-procedure instruction budgets and cross-file lookup budgets all degrade
-to skipped procedures with a stated reason, never to guesses.
+to skipped procedures with a stated reason, never to guesses. The same
+refuse-don't-guess rule covers unknown mnemonics, positional indices the
+assembler rejects (`movup.99`), and body tokens sharing the declaration
+line (`proc f push.1 drop end` -- legal MASM, but events are line-based):
+each bails the procedure with a reason instead of simulating wrongly.
 
 ==============================================================================
 6. DEBUGGER                                                   *miden-masm-dap*
@@ -243,6 +257,10 @@ Launch configuration keys (nvim-dap substitutes `${file}` and
 
 Before each stop the adapter pushes a `miden/uiState` event with the VM
 cycle, operand stack and call stack; |:MasmDapState| shows the latest one.
+
+Concurrent sessions are supported: each launch owns its backend process
+(keyed by its DAP port), a session's end kills only its own backend, and
+the backend's output pipes stay drained for the process's whole lifetime.
 Disable the whole integration with |g:masm_no_dap|.
 
 ==============================================================================
@@ -321,7 +339,11 @@ The resolver mirrors the Miden assembler's project model:
   until the underlying `proc`/`const`/`type` definition is found.
 
 The index roots at the git root (or the outermost directory containing a
-`miden-project.toml`) and is cached for the session.
+`miden-project.toml`) and is cached for the session. Saving a `.masm` file
+the index has not seen, or any `miden-project.toml`, refreshes it
+automatically; resolution results are freshness-keyed on every file a
+lookup consulted, so editing ANY hop of a re-export chain re-resolves.
+Deletions, moves and out-of-editor changes need |:MasmRebuildIndex|.
 
 ==============================================================================
 9. LIMITATIONS                                        *miden-masm-limitations*

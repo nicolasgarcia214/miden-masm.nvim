@@ -164,11 +164,15 @@ local function opcode_items()
   for _, e in ipairs(require("masm.instructions")) do
     local name = e[1]
     if name:find("{", 1, true) then
-      -- Immediate-only templates (`loc_load.{n}`) surface as `loc_load.`;
-      -- variants whose bare mnemonic is also documented (`lte`/`lte.{n}`,
-      -- the reference lists the bare form first) are covered by it.
-      name = name:match("^([%w_%.]-%.){") or ""
-      if name ~= "" and seen[name:sub(1, -2)] then
+      -- Templates surface as their typeable prefix: `loc_load.{n}` as
+      -- `loc_load.`, and `exp.u{n}` as `exp.u` (the placeholder need not sit
+      -- right after a dot -- requiring one silently dropped the exponent
+      -- form). `X.{n}` variants whose bare `X` is also documented (`lte`/
+      -- `lte.{n}`, the reference lists the bare form first) are covered by
+      -- it.
+      name = name:match("^([%w_%.]-)%{") or ""
+      local bare = name:match("^([%w_%.]-)%.$")
+      if bare and seen[bare] then
         name = ""
       end
     end

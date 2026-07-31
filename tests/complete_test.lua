@@ -81,6 +81,15 @@ check("exec.wrappers::: re-exported const excluded", items["LIMIT"] == nil)
 items = words(complete_at("    exec.m::"))
 check("exec.m::: alias expands to the module", items["add_checked"] ~= nil)
 
+-- call. and procref. share the exec. candidate set (procs and qualifiers,
+-- no consts).
+items = words(complete_at("    call."))
+check("call.: local proc offered", items["local_helper"] ~= nil)
+check("call.: const excluded", items["MAX_VALUE"] == nil)
+items = words(complete_at("    procref.math::"))
+check("procref.math::: procs offered", items["add_checked"] ~= nil)
+check("procref.math::: consts excluded", items["MAX_VALUE"] == nil)
+
 -- syscall.: kernel library procs only.
 items = words(complete_at("    syscall."))
 check("syscall.: kernel proc offered", items["exec_kernel_proc"] ~= nil)
@@ -126,6 +135,12 @@ check(
   "opcode: no dotted duplicate of a bare mnemonic",
   items["lte"] ~= nil and items["lte."] == nil
 )
+
+-- Templates whose placeholder does not follow a dot keep their typeable
+-- prefix (regression: `exp.u{n}` was silently dropped from the list).
+items = words(complete_at("    exp"))
+check("opcode: exp.u{n} offered as exp.u", items["exp.u"] ~= nil, vim.inspect(vim.tbl_keys(items)))
+check("opcode: exp.{n} still offered as exp.", items["exp."] ~= nil)
 
 -- Control-flow keywords the reference does not carry.
 items = words(complete_at("    if"))

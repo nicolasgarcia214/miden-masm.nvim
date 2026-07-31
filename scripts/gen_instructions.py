@@ -40,7 +40,7 @@ def main() -> None:
         "--   crates/masm-instructions/data/instruction_reference.toml",
         "",
         "-- stylua: ignore",
-        "return {",
+        "local instructions = {",
     ]
     for e in entries:
         lines.append(
@@ -51,7 +51,17 @@ def main() -> None:
                 lua_quote(e.get("stack_effect", "")),
             )
         )
-    lines.append("}")
+    lines += [
+        "}",
+        "",
+        "-- Reference gaps (mnemonics the metadata lacks but arity.lua simulates)",
+        "-- are filled from the hand-maintained instructions_extra.lua; the",
+        "-- generator emits this merge, so regeneration cannot lose them.",
+        'for _, e in ipairs(require("masm.instructions_extra")) do',
+        "  instructions[#instructions + 1] = e",
+        "end",
+        "return instructions",
+    ]
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"wrote {out} ({len(entries)} instructions)")
 

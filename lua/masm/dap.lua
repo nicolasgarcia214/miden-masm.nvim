@@ -100,22 +100,56 @@ function M._free_port(host, preferred)
   return try(preferred) or try(0)
 end
 
--- The spawned backend process, kept so a new launch (or session end)
--- replaces rather than leaks it.
-local child
+-- Spawned backend processes, keyed by the local port their DAP server was
+-- asked to listen on (nvim-dap supports concurrent sessions, and every
+-- launch gets its own free port): a session's end must kill ITS backend,
+-- not whichever launch happened last. Exposed as M._children for tests.
+local children = {}
+M._children = children
 
-local function kill_child()
-  if child then
-    child:kill("sigterm")
-    child = nil
+-- Output chunks retained for error diagnosis; capped because the pipes stay
+-- open for the child's whole lifetime (below), and a chatty backend must
+-- not grow this without bound. The TAIL is what error reports show.
+local MAX_OUTPUT_CHUNKS = 256
+
+local function close_pipes(c)
+  for _, pipe in ipairs({ c.stdout, c.stderr }) do
+    if pipe and not pipe:is_closing() then
+      pipe:close()
+    end
+  end
+end
+
+local function kill_child(key)
+  local c = children[key]
+  if not c then
+    return
+  end
+  children[key] = nil
+  close_pipes(c)
+  if c.handle and not c.handle:is_closing() then
+    c.handle:kill("sigterm")
+  end
+end
+
+local function kill_all()
+  for key in pairs(children) do
+    kill_child(key)
   end
 end
 
 -- Spawns the backend and calls on_done(err) exactly once: nil when the
 -- readiness line appeared, a reason when the process errored, exited early
 -- or timed out. Output is retained in M._last_output for diagnosis.
-function M._start_adapter(spec, on_done, timeout_ms)
-  kill_child()
+--
+-- The stdout/stderr pipes are NOT closed at readiness: they stay open and
+-- drained until the process exits. Closing them at the handshake left the
+-- still-running backend with dead write ends, and Rust binaries
+-- (miden-debug is one) panic on the resulting EPIPE from println! -- one
+-- log line after the handshake would kill the debug session mid-flight.
+function M._start_adapter(spec, on_done, timeout_ms, key)
+  key = key or spec -- callers without an endpoint get a private key
+  kill_child(key) -- a re-launch on the same endpoint replaces its backend
   M._last_output = {}
   local stdout, stderr = uv.new_pipe(false), uv.new_pipe(false)
   local timer = uv.new_timer()
@@ -127,10 +161,8 @@ function M._start_adapter(spec, on_done, timeout_ms)
     done = true
     timer:stop()
     timer:close()
-    stdout:close()
-    stderr:close()
     if err then
-      kill_child() -- a half-started backend is useless; don't leak it
+      kill_child(key) -- a half-started backend is useless; don't leak it
     end
     vim.schedule(function()
       on_done(err)
@@ -143,11 +175,13 @@ function M._start_adapter(spec, on_done, timeout_ms)
     cwd = spec.cwd,
     stdio = { nil, stdout, stderr },
   }, function(code)
+    local c = children[key]
+    if c and c.handle == handle then
+      children[key] = nil
+      close_pipes(c)
+    end
     if handle then
       handle:close()
-    end
-    if child == handle then
-      child = nil
     end
     finish(("%s exited (code %s) before the DAP server was ready"):format(spec.cmd, code))
   end)
@@ -160,12 +194,15 @@ function M._start_adapter(spec, on_done, timeout_ms)
     end)
     return
   end
-  child = handle
+  children[key] = { handle = handle, stdout = stdout, stderr = stderr }
 
   local function on_read(_, data)
     if data then
       M._last_output[#M._last_output + 1] = data
-      if data:find(READY_PATTERN, 1, true) then
+      if #M._last_output > MAX_OUTPUT_CHUNKS then
+        table.remove(M._last_output, 1)
+      end
+      if not done and data:find(READY_PATTERN, 1, true) then
         finish(nil)
       end
     end
@@ -223,7 +260,7 @@ local function adapter(callback, config)
       return
     end
     callback({ type = "server", host = host, port = port })
-  end)
+  end, nil, port)
 end
 
 local function render_state(state)
@@ -256,7 +293,8 @@ local function show_state()
   vim.bo[buf].modifiable = false
   local width = 1
   for _, l in ipairs(lines) do
-    width = math.max(width, #l)
+    -- Display width, not byte length: operand values can be multibyte.
+    width = math.max(width, vim.fn.strdisplaywidth(l))
   end
   local win = vim.api.nvim_open_win(buf, false, {
     relative = "cursor",
@@ -272,7 +310,10 @@ local function show_state()
       vim.api.nvim_win_close(win, true)
     end
   end, { buffer = buf, nowait = true })
+  -- Grouped (and cleared per show): only one state float exists at a time,
+  -- and a stray global autocmd per invocation would accumulate.
   vim.api.nvim_create_autocmd({ "CursorMoved", "InsertEnter" }, {
+    group = vim.api.nvim_create_augroup("masm_dap_state", { clear = true }),
     once = true,
     callback = function()
       if vim.api.nvim_win_is_valid(win) then
@@ -324,9 +365,16 @@ function M.register()
   dap.listeners.after["event_miden/uiState"]["masm"] = function(_, body)
     M._ui_state = body
   end
-  local function cleanup()
+  -- Kill only the ENDING session's backend (looked up by its adapter port):
+  -- concurrent sessions each own one, and killing "the" child tore down
+  -- whichever session launched last.
+  local function cleanup(session)
     M._ui_state = nil
-    kill_child()
+    local adapter_cfg = session and session.adapter
+    local port = adapter_cfg and tonumber(adapter_cfg.port)
+    if port then
+      kill_child(port)
+    end
   end
   dap.listeners.after.event_terminated["masm"] = cleanup
   dap.listeners.after.event_exited["masm"] = cleanup
@@ -338,8 +386,14 @@ function M.register()
   return true
 end
 
--- Exposed for tests and health.
+-- Exposed for tests and health. _kill(key) kills one backend, _kill() all.
 M._render_state = render_state
-M._kill = kill_child
+M._kill = function(key)
+  if key ~= nil then
+    kill_child(key)
+  else
+    kill_all()
+  end
+end
 
 return M

@@ -255,12 +255,53 @@ local function scan_procs(lines, code_only)
           body_first = body_first + 1
         end
       end
+      -- Body tokens may legally share the declaration line (`proc foo
+      -- push.1 drop end`). They MUST take part in `end` matching -- skipping
+      -- them once let a one-line proc steal the next procedure's `end`,
+      -- mis-attributing every following body range. Events stay line-based,
+      -- so such procs are not simulated either: analyze_proc bails on
+      -- `same_line_body` with a stated reason instead of silently reading an
+      -- empty body.
+      local rest, rest_lnum
+      if is_begin then
+        rest = code:match("^%s*begin%f[^%w_](.*)$")
+        rest_lnum = i
+      elseif not code:find("%(") then
+        rest = code:match("^%s*pub%s+proc%s+[%w_%$]+(.*)$")
+          or code:match("^%s*proc%s+[%w_%$]+(.*)$")
+        rest_lnum = i
+      else
+        -- Typed signature: the remainder follows the last `)` of the line
+        -- where the parens balanced (body_first - 1; equals `i` when they
+        -- balance on the declaration line itself).
+        rest_lnum = body_first - 1
+        local closed = rest_lnum == i and code or code_only(lines[rest_lnum])
+        rest = closed:match(".*%)(.*)$")
+      end
+      if rest and rest:match("^%s*%->") then
+        rest = "" -- a return-type annotation, not body tokens
+      end
+
       -- Find the matching `end`, counting nested blocks. The declaration
-      -- line itself opens the proc; a typed signature adds no tokens that
-      -- open or close blocks.
+      -- (or signature-closing) line's remainder is scanned first.
       local depth, end_lnum = 1, nil
+      local same_line_body = false
+      if rest then
+        for tok in rest:gmatch("%S+") do
+          same_line_body = true
+          if opens_block(tok) then
+            depth = depth + 1
+          elseif tok == "end" then
+            depth = depth - 1
+            if depth == 0 then
+              end_lnum = rest_lnum
+              break
+            end
+          end
+        end
+      end
       local j = body_first
-      while j <= #lines do
+      while not end_lnum and j <= #lines do
         for tok in code_only(lines[j]):gmatch("%S+") do
           if opens_block(tok) then
             depth = depth + 1
@@ -306,6 +347,7 @@ local function scan_procs(lines, code_only)
         name = name,
         lnum = i,
         body_lnum = body_first,
+        same_line_body = same_line_body,
         end_lnum = end_lnum,
         doc_lnum = doc_lnum,
         contract = contract,
@@ -548,6 +590,22 @@ end
 ---------------------------------------------------------------------------
 -- Transfers
 ---------------------------------------------------------------------------
+
+-- Index ranges the assembler accepts for positional ops. Simulating an
+-- out-of-range index (`movup.99`) would model code that cannot assemble --
+-- and in relative mode manufacture a phantom caller draw, up to a bogus
+-- caller-underflow diagnostic. Out of range bails the proc with a reason,
+-- exactly like an unknown mnemonic.
+local SPECIAL_RANGE = {
+  swap = { 1, 15 },
+  movup = { 2, 15 },
+  movdn = { 2, 15 },
+  dup = { 0, 15 },
+  dupw = { 0, 3 },
+  swapw = { 1, 3 },
+  movupw = { 2, 3 },
+  movdnw = { 2, 3 },
+}
 
 -- Positional ops. `n` is the parsed index immediate (nil when absent).
 local function apply_special(base, n, state, ctx, lnum)
@@ -871,6 +929,10 @@ local function apply_op(state, tok, ctx, lnum)
     end
     if not n and (base == "movup" or base == "movdn" or base == "movupw" or base == "movdnw") then
       return nil, ("%s requires an index"):format(base)
+    end
+    local range = SPECIAL_RANGE[base]
+    if n and range and (n % 1 ~= 0 or n < range[1] or n > range[2]) then
+      return nil, ("%s: index outside the assembler's %d..%d range"):format(tok, range[1], range[2])
     end
     apply_special(base, n, state, ctx, lnum)
     return true
@@ -1416,6 +1478,12 @@ local function analyze_proc(ctx)
     proc.bailed = "unterminated procedure"
     return
   end
+  if proc.same_line_body then
+    -- Events are line-based; tokens sharing the declaration line would be
+    -- silently absent from the simulation. Refuse rather than guess.
+    proc.bailed = "body tokens on the declaration line are not simulated"
+    return
+  end
   if
     not FLOORED_INVOCATIONS[proc.invocation]
     and not RELATIVE_INVOCATIONS[proc.invocation]
@@ -1556,8 +1624,16 @@ function M.analyze_lines(lines, path)
     end
     shared.lookups = ctx.lookups or shared.lookups
   end
+  -- Full tiebreak: table.sort is unstable, and same-line diagnostics would
+  -- otherwise come back in nondeterministic order across runs.
   table.sort(result.diagnostics, function(a, b)
-    return a.lnum < b.lnum
+    if a.lnum ~= b.lnum then
+      return a.lnum < b.lnum
+    end
+    if a.code ~= b.code then
+      return a.code < b.code
+    end
+    return a.message < b.message
   end)
   return result
 end

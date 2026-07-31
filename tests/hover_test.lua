@@ -98,6 +98,67 @@ res = hover.content()
 check("instruction hover: dotted sub-op found", res ~= nil and res.lines[1] == "adv.insert_mem")
 vim.cmd("edit!") -- drop the scratch line
 
+-- Cursor exactly on the DOT of an unresolvable dotted operand: NOT on the
+-- mnemonic (regression: an off-by-one counted the dot as the mnemonic's last
+-- column and showed push.{n} family docs for the dot of `push.NO_SUCH`).
+vim.cmd("edit! " .. root .. "app/main.masm")
+vim.api.nvim_buf_set_lines(0, -1, -1, false, { "    push.NO_SUCH_CONST" })
+local last = vim.api.nvim_buf_line_count(0)
+vim.api.nvim_win_set_cursor(0, { last, 8 }) -- 0-based col 8 = the dot
+local dot_res, dot_reason = hover.content()
+check(
+  "dot boundary: dot is not the mnemonic",
+  dot_res == nil and type(dot_reason) == "string",
+  dot_res and vim.inspect(dot_res.lines) or dot_reason
+)
+vim.api.nvim_win_set_cursor(0, { last, 7 }) -- col 7 = `push`'s last char
+dot_res = hover.content()
+check("dot boundary: mnemonic's last char still is", has_line(dot_res, "push.{n}"))
+vim.cmd("edit!")
+
+-- Definitions open MODIFIED in another buffer hover their live text, not the
+-- stale disk state (regression: only the current buffer's text was used).
+local math_buf = vim.fn.bufadd(root .. "core_lib/math.masm")
+vim.fn.bufload(math_buf)
+local math_lines = vim.api.nvim_buf_get_lines(math_buf, 0, -1, false)
+for i, l in ipairs(math_lines) do
+  if l:find("#! Adds two values", 1, true) then
+    vim.api.nvim_buf_set_lines(math_buf, i - 1, i, false, { "#! LIVE-EDITED doc line" })
+    break
+  end
+end
+place("app/main.masm", "exec.math::add_checked", 12)
+res = hover.content()
+check("cross-buffer hover: live text wins over disk", has_line(res, "LIVE-EDITED doc line"))
+check("cross-buffer hover: stale disk doc absent", not has_line(res, "#! Adds two values"))
+vim.api.nvim_buf_call(math_buf, function()
+  vim.cmd("edit!") -- discard the live edit for later checks
+end)
+
+-- The floating-window layer: open, focus on the second call, close on q.
+place("app/main.masm", "exec.math::add_checked", 12)
+local wins_before = #vim.api.nvim_list_wins()
+hover.hover()
+check("float: window opened", #vim.api.nvim_list_wins() == wins_before + 1)
+local cur_before = vim.api.nvim_get_current_win()
+hover.hover()
+local float_win = vim.api.nvim_get_current_win()
+check("float: second call focuses it", float_win ~= cur_before)
+check(
+  "float: q closes it",
+  (function()
+    vim.api.nvim_feedkeys("q", "x", false)
+    return #vim.api.nvim_list_wins() == wins_before
+  end)()
+)
+-- Reopen; cursor movement in the source buffer closes it.
+place("app/main.masm", "exec.math::add_checked", 12)
+hover.hover()
+check("float: reopened", #vim.api.nvim_list_wins() == wins_before + 1)
+vim.api.nvim_win_set_cursor(0, { 1, 0 })
+vim.api.nvim_exec_autocmds("CursorMoved", { buffer = vim.api.nvim_get_current_buf() })
+check("float: cursor movement closes it", #vim.api.nvim_list_wins() == wins_before)
+
 -- The `...` in a doc-comment stack diagram: no content, but never an error
 -- (regression: dots-only tokens crashed the instruction fallback).
 place("core_lib/math.masm", "[b, a, ...]", 7)

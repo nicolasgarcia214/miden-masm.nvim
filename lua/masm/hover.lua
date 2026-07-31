@@ -41,11 +41,13 @@ local function short_path(path)
   return vim.fn.fnamemodify(path, ":~:.")
 end
 
--- Reads the resolved file's lines, preferring the current buffer's (possibly
--- unsaved) text when the definition lives in it.
+-- Reads the resolved file's lines, preferring live buffer text whenever ANY
+-- loaded buffer holds the file -- not just the current one: a definition
+-- edited in another window must hover its unsaved docs, not the disk state.
 local function file_lines(path)
-  if path == vim.api.nvim_buf_get_name(0) then
-    return vim.api.nvim_buf_get_lines(0, 0, -1, false)
+  local bufnr = require("masm.goto")._loaded_bufnr(path)
+  if bufnr then
+    return vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
   end
   local text = require("masm.goto")._read_file(path)
   return text and vim.split(text, "\n")
@@ -89,7 +91,11 @@ local function instruction_token()
       if not base then
         return nil
       end
-      return word, base, col < s + #base
+      -- `col` is 0-based, `s` 1-based: the mnemonic's last byte sits at
+      -- 0-based column s - 1 + #base - 1. `col < s + #base` would count the
+      -- DOT after the mnemonic as on it, showing `push.{n}` family docs when
+      -- hovering the dot of an unresolvable `push.OPERAND`.
+      return word, base, col < s - 1 + #base
     end
     init = e + 1
   end

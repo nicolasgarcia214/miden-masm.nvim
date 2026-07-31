@@ -1,0 +1,13 @@
+#! Regression fixture: a proc named after an instruction mnemonic (Miden's
+#! stdlib really does this -- std::math::u64 defines `add`, `and`, `eq`).
+#! The bare `add` INSTRUCTION tokens below must never count as references to
+#! the proc, or rename would rewrite the opcodes themselves.
+
+proc add
+    push.1 add
+end
+
+proc use_add
+    exec.add
+    push.2 add drop
+end

@@ -7,6 +7,9 @@
 ; the bundled Lua queries since Miden MASM is likewise an `end`-delimited
 ; language.
 
+; `(word)` is the multi-line word-literal form (`[1, 0, 0,\n 0]` spanning
+; lines): upstream indents it too (`(word "]" @end) @indent`), and its `]`
+; is dedented by @indent.end/@indent.branch below exactly like `end`.
 [
   (procedure)
   (entrypoint)

@@ -53,6 +53,10 @@ vim.b.match_words = table.concat({
 -- the tag stack all resolve Miden procs/consts/modules; `<C-t>` jumps back.
 vim.bo.tagfunc = "v:lua.require'masm.goto'.tagfunc"
 
+-- Completion (lua/masm/complete.lua) via 'omnifunc' (<C-x><C-o>): invocation
+-- targets, constants and opcodes from the same index navigation uses.
+vim.bo.omnifunc = "v:lua.require'masm.complete'.omnifunc"
+
 -- Default mappings, on the same keys Neovim's built-in LSP mappings use
 -- (`grr` / `gO`), which would otherwise fail here with "no LSP client".
 -- References resolve through renamed re-exports, so e.g.
@@ -101,7 +105,7 @@ end
 --   * a bare `nunmap <buffer> gd | ...` leaves a trailing space on the lhs
 --     (:h map-trailing-white), unmapping nothing under `silent!`; wrapping
 --     each unmap in :exe with a quoted string keeps the lhs exact.
-local undo = "setl commentstring< comments< iskeyword< tagfunc<"
+local undo = "setl commentstring< comments< iskeyword< tagfunc< omnifunc<"
   .. " | setl expandtab< shiftwidth< tabstop< softtabstop<"
   .. " | setl indentexpr< foldmethod< foldexpr< foldlevel<"
   .. " | silent! call v:lua.vim.treesitter.stop()"

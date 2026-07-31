@@ -356,6 +356,9 @@ function M.contract(doc_lines)
           local parsed, reason = M.parse_list(bracket)
           if parsed then
             out[field] = parsed
+            -- The author's own spelling, for display surfaces (completion
+            -- menus) where re-rendering the parsed form would lose it.
+            out[field .. "_raw"] = bracket
           else
             out[field .. "_reason"] = reason
           end

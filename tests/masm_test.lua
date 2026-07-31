@@ -436,14 +436,18 @@ local drift = goto_mod.unrecognized_imports(table.concat({
   "  first,",
   "  second,",
   "} from miden::core::math",
-  '# use miden::like::this -- in a comment: ignored',
+  "# use miden::like::this -- in a comment: ignored",
   "use miden::core::math::{nested, braces}", -- rust-style suffix braces: NOT a MASM form
   "use miden.core.math", -- dotted path: NOT a MASM form
   "begin",
   "  push.1 drop",
   "end",
 }, "\n"))
-check("drift canary: rust-style braces flagged", #drift == 2 and drift[1].lnum == 10, vim.inspect(drift))
+check(
+  "drift canary: rust-style braces flagged",
+  #drift == 2 and drift[1].lnum == 10,
+  vim.inspect(drift)
+)
 check("drift canary: dotted path flagged", #drift == 2 and drift[2].lnum == 11, vim.inspect(drift))
 
 print(failed == 0 and "ALL PASS" or (failed .. " FAILURES"))

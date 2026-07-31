@@ -613,7 +613,7 @@ local function file_interface(path, index)
   if entry and entry.key == key then
     return entry
   end
-  entry = { key = key, defs = {}, reexports = {} }
+  entry = { key = key, defs = {}, kinds = {}, reexports = {} }
   local text = read_file(path)
   if text then
     local lnum = 0
@@ -623,6 +623,7 @@ local function file_interface(path, index)
       local kw, name = l:match("^(%a+)%s+([%w_]+)")
       if (kw == "proc" or kw == "const" or kw == "type") and not entry.defs[name] then
         entry.defs[name] = lnum
+        entry.kinds[name] = kw
       end
     end
     -- Only `pub use` re-exports a name; private imports are not interface.
@@ -1269,6 +1270,70 @@ function M.make_resolver(bufpath, buftext)
     end
     return item, reason
   end
+end
+
+-- The current buffer's import maps, for masm.complete: `mods` maps a local
+-- qualifier to its module path segments, `syms` a local name to its
+-- { mod = segments, orig = original name } import.
+function M.buffer_imports(buftext)
+  return parse_imports(buftext)
+end
+
+local function interface_symbols(file, index)
+  local iface = file_interface(file, index)
+  local out, seen = {}, {}
+  for name, lnum in pairs(iface.defs) do
+    out[#out + 1] = { name = name, kind = iface.kinds[name], path = file, lnum = lnum }
+    seen[name] = true
+  end
+  -- Re-exported names resolve through the same chain navigation uses; kind
+  -- and location come from the ground-truth definition. An unresolvable
+  -- re-export is still offered by name (kind unknown): the name is visibly
+  -- part of the module's interface even when its source is not indexed.
+  for _, re in ipairs(iface.reexports) do
+    for _, it in ipairs(re.items) do
+      if not seen[it.alias] then
+        seen[it.alias] = true
+        local p, l, dn = find_symbol(file, it.alias, index, 0)
+        local kind = p and file_interface(p, index).kinds[dn] or nil
+        out[#out + 1] = { name = it.alias, kind = kind, path = p, lnum = l }
+      end
+    end
+  end
+  table.sort(out, function(a, b)
+    return a.name < b.name
+  end)
+  return out
+end
+
+-- The visible interface of module `segs` -- its own proc/const/type
+-- definitions plus the names it re-exports -- as a sorted list of
+-- { name, kind, path, lnum }. Cache-backed like navigation. Returns nil and
+-- a reason when the module cannot be resolved.
+function M.module_symbols(bufpath, segs)
+  local ok, index = pcall(build_index, bufpath, get_config())
+  if not ok then
+    return nil, "indexing failed: " .. tostring(index)
+  end
+  local file = resolve_module_cached(segs, index)
+  if not file then
+    return nil, "module " .. table.concat(segs, "::") .. " not found"
+  end
+  return interface_symbols(file, index)
+end
+
+-- The kernel library's interface (what `syscall.` targets resolve against).
+function M.kernel_symbols(bufpath)
+  local ok, index = pcall(build_index, bufpath, get_config())
+  if not ok then
+    return nil, "indexing failed: " .. tostring(index)
+  end
+  for _, lib in ipairs(index.libs) do
+    if lib.kernel then
+      return interface_symbols(lib.root_file, index)
+    end
+  end
+  return nil, "no kernel library in the project"
 end
 
 -- 'tagfunc' implementation. With the 'c' flag (normal-mode <C-]> / gd) the

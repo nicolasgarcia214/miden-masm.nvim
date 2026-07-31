@@ -342,12 +342,9 @@ local function goto_mod()
   return require("masm.goto")
 end
 
--- Contracts for a file, keyed by declaration line. The current buffer's
--- contracts come from the caller's own scan (unsaved edits must win).
-local function contracts_for_file(ctx, path)
-  if path == ctx.bufpath then
-    return ctx.local_procs
-  end
+-- Scanned procs (declarations + doc contracts) of an on-disk file, cached
+-- under its freshness key.
+local function file_procs(path)
   local g = goto_mod()
   local key = g._stat_key(path)
   if not key then
@@ -365,6 +362,46 @@ local function contracts_for_file(ctx, path)
   local procs = scan_procs(lines, g._code_only)
   contract_cache[path] = { key = key, procs = procs }
   return procs
+end
+
+-- Contracts for a file, keyed by declaration line. The current buffer's
+-- contracts come from the caller's own scan (unsaved edits must win).
+local function contracts_for_file(ctx, path)
+  if path == ctx.bufpath then
+    return ctx.local_procs
+  end
+  return file_procs(path)
+end
+
+-- Compact `[inputs] -> [outputs]` summary of the procedure declared at
+-- `path`:`lnum`, in the author's own notation, or nil when the file has no
+-- parseable contract there. Cache-backed; used by masm.complete menus.
+function M.contract_summary(path, lnum)
+  local procs = file_procs(path)
+  local proc = procs and procs.by_lnum[lnum]
+  local c = proc and proc.contract
+  if not c or (not c.inputs_raw and not c.outputs_raw) then
+    return nil
+  end
+  return (c.inputs_raw or "[?]") .. " -> " .. (c.outputs_raw or "[?]")
+end
+
+-- Same summaries for the (possibly unsaved) current buffer: one scan of
+-- `lines`, returning name -> { lnum, summary }. Not cached -- completion
+-- calls are user-paced and a scan of a real file is well under a
+-- millisecond.
+function M.buffer_proc_summaries(lines)
+  local procs = scan_procs(lines, goto_mod()._code_only)
+  local out = {}
+  for _, proc in ipairs(procs.list) do
+    local c = proc.contract
+    local summary
+    if c and (c.inputs_raw or c.outputs_raw) then
+      summary = (c.inputs_raw or "[?]") .. " -> " .. (c.outputs_raw or "[?]")
+    end
+    out[proc.name] = { lnum = proc.lnum, summary = summary }
+  end
+  return out
 end
 
 -- Resolves an invocation target to its contract via goto's resolver.

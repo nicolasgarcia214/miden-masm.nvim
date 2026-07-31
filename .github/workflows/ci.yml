@@ -73,7 +73,7 @@ jobs:
       # Keyed on the file carrying the revision pin (plugin/miden-masm.lua,
       # the Makefile's own source of truth): same hash means same revision,
       # so a hit can never restore a parser built from another grammar.
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: tests/.parser-build
           key: queries-parser-${{ runner.os }}-cc${{ steps.cc.outputs.version }}-${{ hashFiles('plugin/miden-masm.lua') }}

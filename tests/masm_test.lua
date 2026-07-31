@@ -403,6 +403,49 @@ for _, s in ipairs(syms) do
 end
 check("symbols: begin_impostor is not an entrypoint", not impostor)
 
+-- ------------------------------------------------------------------------
+-- Dialect-drift canary: unrecognized use-statement forms are reported
+-- ------------------------------------------------------------------------
+
+local function read_fixture(rel)
+  local fh = assert(io.open(root .. rel, "r"))
+  local text = fh:read("*a")
+  fh:close()
+  return text
+end
+
+-- Every fixture file exercises only recognized forms: the canary must be
+-- silent on all of them, or it would cry wolf on healthy projects.
+for _, rel in ipairs({
+  "app/main.masm",
+  "app/aliased.masm",
+  "app/stack.masm",
+  "core_lib/mod.masm",
+  "std_lib/wrappers.masm",
+}) do
+  local drift = goto_mod.unrecognized_imports(read_fixture(rel))
+  check("drift canary: silent on " .. rel, #drift == 0, vim.inspect(drift))
+end
+
+local drift = goto_mod.unrecognized_imports(table.concat({
+  "use miden::core::math", -- plain: recognized
+  "use miden::core::math as m", -- as-rename: recognized
+  "use miden::core -> legacy", -- legacy arrow: recognized
+  "pub use { a, b as c } from miden::core::math", -- selective: recognized
+  "use {", -- multi-line selective, opening line: recognized
+  "  first,",
+  "  second,",
+  "} from miden::core::math",
+  '# use miden::like::this -- in a comment: ignored',
+  "use miden::core::math::{nested, braces}", -- rust-style suffix braces: NOT a MASM form
+  "use miden.core.math", -- dotted path: NOT a MASM form
+  "begin",
+  "  push.1 drop",
+  "end",
+}, "\n"))
+check("drift canary: rust-style braces flagged", #drift == 2 and drift[1].lnum == 10, vim.inspect(drift))
+check("drift canary: dotted path flagged", #drift == 2 and drift[2].lnum == 11, vim.inspect(drift))
+
 print(failed == 0 and "ALL PASS" or (failed .. " FAILURES"))
 if failed > 0 then
   os.exit(1)

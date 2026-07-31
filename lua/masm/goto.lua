@@ -516,6 +516,58 @@ local function parse_imports(text)
   return mods, syms
 end
 
+-- Dialect-drift canary. Resolution is text-based against the import forms
+-- the current MASM dialect uses; a future dialect could add a form these
+-- patterns miss, and the failure mode would be silent (imports simply not
+-- seen, navigation and stack analysis quietly degraded). This scan makes
+-- that loud: any code line that starts a `use` statement but matches none of
+-- the recognized forms is reported, so drift surfaces as a diagnostic on the
+-- offending line instead of as mysterious "not found" answers later.
+-- Returns a list of { lnum, text }.
+function M.unrecognized_imports(text)
+  local code = code_text(text)
+  -- Line numbers of recognized selective `use {..} from ..` statements: the
+  -- opening line is the one that would otherwise look unrecognized (its
+  -- continuation lines never start with `use`).
+  local covered = {}
+  local cur_line, cur_off = 1, 1
+  local function lnum_of(off)
+    while true do
+      local nl = code:find("\n", cur_off, true)
+      if not nl or nl >= off then
+        return cur_line
+      end
+      cur_line = cur_line + 1
+      cur_off = nl + 1
+    end
+  end
+  each_selective_use(code, false, function(stmt)
+    covered[lnum_of(stmt.start)] = true
+  end)
+  local out = {}
+  local lnum = 0
+  for raw in code:gmatch("([^\n]*)\n?") do
+    lnum = lnum + 1
+    local l = strip_pub(raw)
+    if l:match("^use%f[^%w_]") and not covered[lnum] then
+      local recognized = l:match("^use%s+[%w_:]+%s+as%s+[%w_]+%s*$")
+        or l:match("^use%s+[%w_:]+%s*%-%>%s*[%w_]+%s*$")
+        or l:match("^use%s+[%w_:]+%s*$")
+        -- The opening line of a selective use whose braces close on a LATER
+        -- line: covered[] only has statements whose braces closed; an
+        -- unclosed-because-still-being-typed block should not flap between
+        -- states as the user types, so the opening shape alone passes here.
+        -- A block left truly unterminated still surfaces: its `from` line
+        -- never parses and resolution reports the import as missing.
+        or l:match("^use%s*{")
+      if not recognized then
+        out[#out + 1] = { lnum = lnum, text = vim.trim(raw) }
+      end
+    end
+  end
+  return out
+end
+
 ---------------------------------------------------------------------------
 -- Symbol lookup inside a module file
 ---------------------------------------------------------------------------

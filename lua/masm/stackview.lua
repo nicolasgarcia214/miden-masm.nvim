@@ -79,7 +79,7 @@ local SEVERITIES = {
   hint = vim.diagnostic.severity.HINT,
 }
 
-local function publish(bufnr, result, cfg)
+local function publish(bufnr, result, cfg, drift)
   local items = {}
   if cfg.diagnostics then
     for _, d in ipairs(result.diagnostics) do
@@ -95,6 +95,20 @@ local function publish(bufnr, result, cfg)
           source = "masm-stack",
         }
       end
+    end
+    -- Dialect-drift canary (masm.goto): a `use` form the resolver does not
+    -- recognize would otherwise fail silently -- imports not seen, navigation
+    -- and callee contracts quietly degraded. Surfacing it here turns grammar/
+    -- dialect drift into a visible signal on the offending line.
+    for _, u in ipairs(drift or {}) do
+      items[#items + 1] = {
+        lnum = u.lnum - 1,
+        col = 0,
+        severity = vim.diagnostic.severity.WARN,
+        message = "unrecognized use-statement form (dialect drift?): navigation will not see this import",
+        code = "unrecognized-import",
+        source = "masm-goto",
+      }
     end
   end
   vim.diagnostic.set(diag_ns, bufnr, items)
@@ -189,7 +203,9 @@ function M.refresh(bufnr)
     end
     return
   end
-  publish(bufnr, result, cfg)
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local drift = require("masm.goto").unrecognized_imports(table.concat(lines, "\n"))
+  publish(bufnr, result, cfg, drift)
   if state.overlay then
     render_overlay(bufnr, result, cfg)
   else

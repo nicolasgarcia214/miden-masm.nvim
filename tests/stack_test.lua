@@ -546,6 +546,25 @@ check("view: toggle off clears ghosts", #marks() == 0)
 stackview.detach(bufnr)
 check("view: detach clears diagnostics", #published() == 0)
 
+-- Dialect-drift canary rides the same pipeline: an unrecognized use form in
+-- the buffer is published as a masm-goto WARN alongside stack diagnostics.
+vim.api.nvim_buf_set_lines(bufnr, 0, 0, false, { "use miden::core::math::{rusty}" })
+stackview.attach(bufnr)
+stackview.refresh(bufnr)
+local drift_diag
+for _, d in ipairs(vim.diagnostic.get(bufnr, { namespace = stackview._diag_ns })) do
+  if d.code == "unrecognized-import" then
+    drift_diag = d
+  end
+end
+check(
+  "view: drift canary published",
+  drift_diag ~= nil and drift_diag.lnum == 0 and drift_diag.source == "masm-goto",
+  vim.inspect(drift_diag)
+)
+stackview.detach(bufnr)
+vim.cmd("edit!") -- drop the injected line so later suites see the fixture as on disk
+
 ---------------------------------------------------------------------------
 
 if failed > 0 then

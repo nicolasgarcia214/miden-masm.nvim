@@ -1312,6 +1312,39 @@ vim.g.masm_stack = nil
 stackview.detach(bufnr)
 vim.cmd("edit!")
 
+-- Early-out reentrancy: a user autocmd on DiagnosticChanged that EDITS the
+-- buffer runs synchronously inside publish. The recorded tick must describe
+-- the lines that were analyzed (captured with the buffer read), not the
+-- autocmd's post-edit state -- or the early-out would treat the stale
+-- publish as current and pin it until some unrelated edit.
+vim.g.masm_stack = { debounce_ms = 30 }
+stackview.attach(bufnr)
+vim.wait(200, function()
+  return false
+end, 20) -- drain attach's own scheduled first refresh
+local reentrant = vim.api.nvim_create_autocmd("DiagnosticChanged", {
+  buffer = bufnr,
+  once = true,
+  callback = function()
+    vim.api.nvim_buf_set_lines(bufnr, 0, 0, false, { "use miden::core::math::{rusty}" })
+  end,
+})
+stackview.refresh(bufnr) -- publish fires the autocmd; the edit lands mid-refresh
+vim.api.nvim_exec_autocmds("TextChanged", { buffer = bufnr })
+local reentrant_seen = vim.wait(3000, function()
+  for _, d in ipairs(published()) do
+    if d.code == "unrecognized-import" then
+      return true
+    end
+  end
+  return false
+end, 20)
+check("view: mid-publish edit is not swallowed by the early-out", reentrant_seen)
+pcall(vim.api.nvim_del_autocmd, reentrant) -- once=true already removed it on the happy path
+vim.g.masm_stack = nil
+stackview.detach(bufnr)
+vim.cmd("edit!")
+
 -- MAX_BUF_BYTES gate: an oversized buffer is refused BEFORE the analyzer
 -- runs (memo counters stay untouched), without an error and with nothing
 -- published. The buffer needs no name -- the size gate fires first.

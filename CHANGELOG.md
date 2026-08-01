@@ -248,6 +248,43 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- Index roots and explicit buffer paths are canonicalized (symlinks
+  resolved) before use, matching how Neovim spells buffer names. Paths
+  reaching one file through two spellings -- macOS's `/var` vs
+  `/private/var` temp directory is the everyday case, and it broke the
+  macOS CI leg -- no longer defeat the exact-name buffer matching that
+  live-buffer-wins resolution relies on.
+- `references()`/rename read the definition line with the same
+  live-buffer-wins semantics as resolution. A definition file left modified
+  in a non-current buffer (the post-rename, unsaved-for-review state)
+  previously had its definition line read from disk while the line NUMBER
+  came from the live buffer, silently failing the scan.
+- Two near-simultaneous debug launches can no longer tear each other down:
+  a new launch never reuses a port that is already a live backend's key
+  (binding used to succeed in the window before the first backend bound its
+  socket, and the second launch then killed the first's process).
+- Ending an `attach` debug session no longer kills a launch session's
+  backend listening on the same port; only launch sessions own their
+  backend process.
+- The stack-analysis debounce records the changedtick captured with the
+  analyzed buffer lines, so a `DiagnosticChanged` autocmd that edits the
+  buffer mid-publish cannot pin stale diagnostics; the debounce early-out
+  also re-checks `vim.g.masm_stack`, so config changes apply without
+  needing an edit or write.
+- Warm symbol resolution stays cheap after `:bdelete` of a dependency file:
+  the cached "no buffer for this path" answer revalidates with
+  `bufloaded()` instead of `bufexists()`, which kept forcing the full
+  buffer walk the cache exists to avoid.
+- A `use` statement with trailing junk is no longer half-accepted: the
+  import parser and the dialect-drift canary now share one set of anchored
+  patterns, so such a line is refused as an import and reported as drift
+  instead of being imported *and* flagged.
+- Backend output retained for debug-launch diagnostics is capped by bytes
+  (64 KB per session key) instead of by chunk count, bounding worst-case
+  memory held for chatty backends.
+- `make test-queries` rebuilds the vendored grammar when the pinned
+  revision in `plugin/miden-masm.lua` changes, instead of validating
+  queries against a stale build.
 - `caller-underflow` no longer fires on poisoned states: cells drawn from
   the caller while the state is poisoned (e.g. after an exec of an
   undocumented callee) are phantom cells from a suffix the analyzer

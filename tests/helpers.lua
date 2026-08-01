@@ -15,6 +15,19 @@ M.here = vim.fs.dirname(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), 
 M.plugin_root = vim.fs.dirname(M.here)
 vim.opt.rtp:prepend(M.plugin_root)
 
+-- A fresh temp directory in its CANONICAL (symlink-resolved) spelling.
+-- Neovim spells buffer names with symlinks resolved, and the temp base can
+-- sit behind one (macOS's /var -> /private/var is the everyday case) -- a
+-- suite comparing tempname-derived paths against buffer names or index
+-- paths would then mismatch on the spelling alone. Resolving once here
+-- keeps every path derived from the returned root comparable.
+---@return string dir
+function M.temp_dir()
+  local d = vim.fn.tempname()
+  vim.fn.mkdir(d, "p")
+  return (vim.uv or vim.loop).fs_realpath(d) or d
+end
+
 -- Failures so far. check() increments it; suites with bespoke assertion
 -- loops (masm's go-to-def table, the queries suite) increment it directly.
 M.failed = 0

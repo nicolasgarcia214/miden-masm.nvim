@@ -29,8 +29,7 @@ local fixtures = here .. "/fixtures/"
 -- is deleted in the teardown at the bottom, whatever happened in between.
 local tmp_dirs = {}
 local function mktmp()
-  local d = vim.fn.tempname()
-  vim.fn.mkdir(d, "p")
+  local d = helpers.temp_dir()
   tmp_dirs[#tmp_dirs + 1] = d
   return d
 end
@@ -160,6 +159,28 @@ local run_ok, run_err = pcall(function()
     end
   end
   check("walk: symlinked directory not descended", not through_link, vim.inspect(widx.masm))
+
+  -- A symlink-SPELLED root is different from a symlinked directory inside
+  -- the tree: the root is canonicalized before walking (Neovim spells
+  -- buffer names with symlinks resolved -- /var vs /private/var on macOS --
+  -- and index paths must match that spelling for exact-name buffer lookups
+  -- to work), so the index carries canonical paths, not the alias.
+  local canon_root = mktmp()
+  write_file(canon_root .. "/main.masm", "begin\n    push.1 drop\nend\n")
+  write_file(canon_root .. "/helper.masm", "pub proc helped\n    push.1 drop\nend\n")
+  local alias_root = canon_root .. "-alias"
+  assert(uv.fs_symlink(canon_root, alias_root, { dir = true }))
+  project.clear_cache()
+  local cidx = with_notify(function()
+    return project.build_index(alias_root .. "/main.masm") -- alias spelling in
+  end)
+  check(
+    "walk: symlink-spelled root indexes canonical paths",
+    cidx.masm_set[canon_root .. "/helper.masm"] == true
+      and cidx.masm_set[alias_root .. "/helper.masm"] == nil,
+    vim.inspect(cidx.masm)
+  )
+  vim.fn.delete(alias_root)
 
   -------------------------------------------------------------------------
   -- project walk: MAX_SCAN_DEPTH honored, truncation reported

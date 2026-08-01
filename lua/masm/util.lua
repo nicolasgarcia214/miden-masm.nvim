@@ -208,6 +208,19 @@ end
 -- Hardened file access
 ---------------------------------------------------------------------------
 
+-- Canonical (symlink-resolved) spelling of a path. Neovim resolves symlinks
+-- when it names buffers, so every path the plugin compares against a buffer
+-- name -- index roots and the paths walked from them, explicit caller-passed
+-- buffer paths -- must be canonicalized the same way, or the two spellings
+-- of one file (macOS's /var vs /private/var is the everyday case) break the
+-- exact-name buffer matching that live-buffer-wins resolution rides on.
+---@param path string
+---@return string canonical the resolved path, or `path` unchanged when it
+---  cannot be resolved (nonexistent files keep their given spelling)
+function M.canonical(path)
+  return M.uv.fs_realpath(path) or path
+end
+
 -- No real .masm file approaches this; a "file" beyond it is junk or a trap
 -- (e.g. a `.masm`-named symlink pointing at something huge).
 M.MAX_FILE_BYTES = 2 * 1024 * 1024

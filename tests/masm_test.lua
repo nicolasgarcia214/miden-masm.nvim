@@ -32,7 +32,7 @@ local function copy_tree(src, dst)
   end
 end
 
-local tmp_root = vim.fn.tempname()
+local tmp_root = helpers.temp_dir()
 copy_tree(here .. "/fixtures", tmp_root .. "/fixtures")
 local root = tmp_root .. "/fixtures/"
 
@@ -372,6 +372,23 @@ check(
   unrel ~= vim.NIL and unrel[1] ~= nil and unrel[1].filename:find("hostile", 1, true) ~= nil
 )
 
+-- Trailing junk after a `use` statement: the anchored patterns refuse it as
+-- an import, and the drift canary reports the line -- resolution and canary
+-- agree because they share the pattern definitions.
+local junk_use = "use core::math as m junk\n"
+local junk_mods = goto_mod.buffer_imports(junk_use)
+check(
+  "use junk: trailing junk does not register an import",
+  junk_mods.m == nil,
+  vim.inspect(junk_mods)
+)
+local junk_drift = goto_mod.unrecognized_imports(junk_use)
+check(
+  "use junk: canary reports the malformed line",
+  junk_drift[1] ~= nil and junk_drift[1].lnum == 1,
+  vim.inspect(junk_drift)
+)
+
 -- Stale-cache regression: after an on-disk edit shifts a definition, the
 -- next jump must land on the new line, without :MasmRebuildIndex. The fixture
 -- copy is mutated on disk, so EVERYTHING between the write and the restore
@@ -519,6 +536,38 @@ for _, b in ipairs(vim.api.nvim_list_bufs()) do
 end
 check("buffer/disk matrix: block completed", matrix_ok, tostring(matrix_err))
 
+-- Remembered-"none" stays cheap while an UNLOADED buffer exists for the
+-- path: :bdelete leaves the buffer in the list (bufexists == 1) but not
+-- loaded, and the cheap revalidation must answer "still none" from
+-- bufloaded() -- falling back to the full buffer walk on every warm hit is
+-- exactly the per-hit cost entry.bufnr exists to avoid.
+for _, b in ipairs(vim.api.nvim_list_bufs()) do
+  if vim.api.nvim_buf_get_name(b) == math_path then
+    vim.cmd("bwipeout! " .. b)
+  end
+end
+vim.cmd("edit! " .. root .. "app/main.masm")
+goto_mod.clear_cache()
+local warmup = goto_mod.tagfunc("math::add_checked", "", {})
+check("bufloaded: warm-up jump resolves", warmup ~= vim.NIL and warmup[1] ~= nil)
+local unloaded_buf = vim.fn.bufadd(math_path) -- exists, NOT loaded: the :bdelete state
+local util_mod = require("masm.util")
+local real_walk = util_mod.loaded_bufnr
+local walks = 0
+-- Counting wrapper around the module function; deliberate test stub.
+---@diagnostic disable-next-line: duplicate-set-field
+util_mod.loaded_bufnr = function(p)
+  if p == math_path then
+    walks = walks + 1
+  end
+  return real_walk(p)
+end
+local warm_hit = goto_mod.tagfunc("math::add_checked", "", {})
+util_mod.loaded_bufnr = real_walk
+check("bufloaded: warm hit still resolves", warm_hit ~= vim.NIL and warm_hit[1] ~= nil)
+check("bufloaded: no buffer walk while the buffer stays unloaded", walks == 0, "walked " .. walks)
+vim.cmd("bwipeout! " .. unloaded_buf)
+
 -- Document symbols.
 vim.cmd("edit! " .. root .. "core_lib/math.masm")
 local syms = goto_mod.document_symbols() or {}
@@ -567,6 +616,43 @@ check(
   #async_list == #sync_refs,
   ("async %d vs sync %d"):format(#async_list, #sync_refs)
 )
+
+-- A def-file buffer left MODIFIED while another file is current (the
+-- post-rename, unsaved-for-review state): resolution takes def_lnum from
+-- the live buffer, so the def LINE must be read from it too -- reading disk
+-- would find whatever sits on that line and abort the whole scan.
+local live_def = vim.fn.bufadd(root .. "core_lib/math.masm")
+vim.fn.bufload(live_def)
+vim.api.nvim_buf_set_lines(live_def, 0, 0, false, { "# pad", "# pad", "# pad" })
+place("app/main.masm", "push.MAX_VALUE", 5)
+local live_refs = goto_mod.references({ sync = true }) or {}
+close_lists()
+check(
+  "modified def buffer: references resolve against the live buffer",
+  #live_refs > 0 and #live_refs == #sync_refs,
+  ("live %d vs pristine %d"):format(#live_refs, #sync_refs)
+)
+local function max_value_def_lnum(items)
+  for _, it in ipairs(items) do
+    if
+      it.filename:sub(-#"core_lib/math.masm") == "core_lib/math.masm"
+      and it.text:find("pub const MAX_VALUE", 1, true)
+    then
+      return it.lnum
+    end
+  end
+end
+check(
+  "modified def buffer: def site tracks the padded live line",
+  max_value_def_lnum(live_refs) == (max_value_def_lnum(sync_refs) or 0) + 3,
+  ("live %s vs pristine %s"):format(
+    tostring(max_value_def_lnum(live_refs)),
+    tostring(max_value_def_lnum(sync_refs))
+  )
+)
+vim.api.nvim_buf_call(live_def, function()
+  vim.cmd("edit!")
+end)
 
 -- ------------------------------------------------------------------------
 -- Rename: definition, spelled references and import-item originals change;
@@ -832,7 +918,7 @@ check("index refresh: block completed", refresh_ok, tostring(refresh_err))
 -- ------------------------------------------------------------------------
 
 -- extra_roots: a library OUTSIDE the project tree resolves once listed.
-local ext_root = vim.fn.tempname()
+local ext_root = helpers.temp_dir()
 vim.fn.mkdir(ext_root .. "/extlib", "p")
 local config_ok, config_err = pcall(function()
   local w = assert(io.open(ext_root .. "/extlib/miden-project.toml", "w"))

@@ -57,6 +57,7 @@ local MAX_BUF_BYTES = 2 * 1024 * 1024
 ---@field overlay boolean ghost-text overlay currently enabled
 ---@field notified boolean? a too-large/failed notice was already shown
 ---@field analyzed_tick integer? changedtick at the last successful publish
+---@field analyzed_cfg masm.StackViewConfig? config that produced that publish
 
 ---@type table<integer, masm.StackViewState>
 local buffers = {}
@@ -277,6 +278,12 @@ function M.refresh(bufnr)
   -- concatenated a second copy of it).
   local path = vim.api.nvim_buf_get_name(bufnr)
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  -- Captured WITH the lines, not after publish: vim.diagnostic.set fires
+  -- DiagnosticChanged synchronously, and a user autocmd there that edits the
+  -- buffer would otherwise smuggle its post-edit tick into analyzed_tick --
+  -- describing lines that were never analyzed, and pinning the stale publish
+  -- until some unrelated edit.
+  local tick = vim.api.nvim_buf_get_changedtick(bufnr)
   -- Last-resort containment: this runs from TextChanged/InsertLeave
   -- autocmds, and one uncaught nil deep in the simulator would otherwise
   -- become a repeating error notification on every edit. The engine's own
@@ -310,8 +317,12 @@ function M.refresh(bufnr)
   end
   -- Records what was published so the debounced path can skip a no-op
   -- re-analysis (InsertLeave without an edit). Only set after a successful
-  -- publish: failed attempts stay retryable.
-  state.analyzed_tick = vim.api.nvim_buf_get_changedtick(bufnr)
+  -- publish: failed attempts stay retryable. The config snapshot rides
+  -- along because the skip is only sound while the config that produced the
+  -- publish still holds ("read lazily on every refresh" must survive the
+  -- early-out).
+  state.analyzed_tick = tick
+  state.analyzed_cfg = cfg
 end
 
 ---@param bufnr integer
@@ -338,6 +349,7 @@ local function schedule_refresh(bufnr)
         and st.analyzed_tick
         and vim.api.nvim_buf_is_loaded(bufnr)
         and vim.api.nvim_buf_get_changedtick(bufnr) == st.analyzed_tick
+        and vim.deep_equal(get_config(), st.analyzed_cfg)
       then
         return
       end

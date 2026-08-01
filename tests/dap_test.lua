@@ -123,6 +123,20 @@ check(
 dap._kill()
 check("adapter: kill-all clears the table", next(dap._children) == nil)
 
+-- A NEW launch must never take a live child's key: binding the preferred
+-- port can succeed in the window before that child's backend binds its
+-- socket, and reusing the key would kill the sibling session's backend
+-- (replace-on-relaunch is for RE-launches of one endpoint only).
+check("launch port: sibling backend ready", wait_result(ready_spec, nil, 3001) == "ready")
+local lport = dap._launch_port("127.0.0.1", 3001)
+check(
+  "launch port: live child's key avoided",
+  type(lport) == "number" and lport ~= 3001,
+  tostring(lport)
+)
+check("launch port: sibling backend untouched", dap._children[3001] ~= nil)
+dap._kill()
+
 -- Quitting Neovim without nvim-dap's terminated/exited/disconnect events
 -- must not orphan backends: the first spawn registers a VimLeavePre hook
 -- that kills them all. Fired here via doautocmd (headless nvim -l never
@@ -263,6 +277,24 @@ stub.adapters.miden(function(cfg)
   failed_cb, failed_val = true, cfg
 end, { request = "launch" })
 check("adapter fn: setup failure resumes callback with nil", failed_cb and failed_val == nil)
+
+-- Session cleanup: only LAUNCH sessions own a backend. An attach session
+-- can be attached to a sibling launch's backend on that very port, so its
+-- disconnect must leave the child alone; the launch session's own end must
+-- still kill it.
+local launch_res = "pending"
+dap2._start_adapter(ready_spec, function(err)
+  launch_res = err or "ready"
+end, nil, 4712)
+vim.wait(5000, function()
+  return launch_res ~= "pending"
+end, 10)
+check("cleanup: launch backend ready", launch_res == "ready", tostring(launch_res))
+local cleanup = stub.listeners.after.event_terminated["masm"]
+cleanup({ config = { request = "attach" }, adapter = { port = 4712 } })
+check("cleanup: attach disconnect spares the launch backend", dap2._children[4712] ~= nil)
+cleanup({ config = { request = "launch" }, adapter = { port = 4712 } })
+check("cleanup: launch termination kills its backend", dap2._children[4712] == nil)
 
 local lines = dap._render_state({
   cycle = 42,

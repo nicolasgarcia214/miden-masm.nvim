@@ -42,7 +42,9 @@ check:
 fmt:
 	npx --yes @johnnymorganz/stylua-bin@2.5.2 .
 
-$(PARSER_BUILD)/parser/masm.so:
+# Depends on the pin's home so a grammar-revision bump rebuilds the parser
+# instead of silently validating queries against the previously built one.
+$(PARSER_BUILD)/parser/masm.so: plugin/miden-masm.lua
 	mkdir -p $(PARSER_BUILD)/parser
 	test -d $(PARSER_BUILD)/tree-sitter-masm || \
 		git clone --quiet https://github.com/0xMiden/tree-sitter-masm $(PARSER_BUILD)/tree-sitter-masm

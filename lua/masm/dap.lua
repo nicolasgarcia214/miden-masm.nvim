@@ -125,16 +125,41 @@ end
 local children = {}
 M._children = children
 
+-- The port for a NEW launch: like _free_port, but never the key of a live
+-- child. Binding the preferred port succeeds in the window before an
+-- in-flight sibling's backend binds its socket, and reusing that sibling's
+-- key would make _start_adapter's kill_child tear down a healthy session --
+-- the replace-on-relaunch semantics are for RE-launches of one endpoint,
+-- not for two launches colliding on the default port. (A live child whose
+-- explicit port you want back is released by terminating its session.)
+---@param host string
+---@param preferred integer
+---@return integer? port nil when nothing safe can be bound on `host`
+function M._launch_port(host, preferred)
+  if children[preferred] then
+    preferred = 0
+  end
+  local port = M._free_port(host, preferred)
+  -- A kernel-assigned port can in principle still land on a live child's
+  -- not-yet-bound key; refusing the launch is the safe answer to that
+  -- vanishing-odds race, and the caller reports it like port exhaustion.
+  if port and children[port] then
+    return nil
+  end
+  return port
+end
+
 -- Output chunks retained for error diagnosis, keyed like `children`: with
 -- concurrent sessions a shared buffer let a second launch wipe the first's
 -- captured output and interleave both backends' writes. Entries are NOT
 -- cleared in kill_child -- error paths kill the child first and read the
 -- output after -- so they persist until a re-launch on the same key; each
--- is capped because the pipes stay open for the child's whole lifetime
--- (below), and a chatty backend must not grow it without bound. The TAIL
--- is what error reports show.
+-- is capped BY BYTES (a chunk cap left up to chunk-size * count retained,
+-- ~16MB per key for 64KB pipe reads) because the pipes stay open for the
+-- child's whole lifetime (below), and a chatty backend must not grow it
+-- without bound. The TAIL is what error reports show.
 local outputs = {}
-local MAX_OUTPUT_CHUNKS = 256
+local MAX_OUTPUT_BYTES = 64 * 1024
 
 -- Captured output for one backend, by the key its launch used. Tests hook
 -- this; the adapter's error formatting reads it by port.
@@ -273,10 +298,15 @@ function M._start_adapter(spec, on_done, timeout_ms, key)
   children[key] = { handle = handle, stdout = stdout, stderr = stderr }
   ensure_exit_hook()
 
+  local output_bytes = 0
   local function on_read(_, data)
     if data then
       output[#output + 1] = data
-      if #output > MAX_OUTPUT_CHUNKS then
+      output_bytes = output_bytes + #data
+      -- Keep the newest chunk even when it alone exceeds the cap: the tail
+      -- is what error reports show.
+      while output_bytes > MAX_OUTPUT_BYTES and #output > 1 do
+        output_bytes = output_bytes - #output[1]
         table.remove(output, 1)
       end
       if not done and data:find(READY_PATTERN, 1, true) then
@@ -317,7 +347,7 @@ local function adapter(callback, config)
     callback({ type = "server", host = host, port = config.port or 4711 })
     return
   end
-  local port = M._free_port(host, config.port or 4711)
+  local port = M._launch_port(host, config.port or 4711)
   if not port then
     vim.notify("masm dap: could not allocate a local port on " .. host, vim.log.levels.ERROR)
     callback(nil)
@@ -449,7 +479,15 @@ function M.register()
   -- whichever session launched last.
   local function cleanup(session)
     M._ui_state = nil
-    local adapter_cfg = session and session.adapter
+    -- Only LAUNCH sessions own a backend. An attach session's target on
+    -- that port can be a sibling launch's live backend (nothing else could
+    -- have bound the port our child owns), and its disconnect must not
+    -- tear that session down.
+    local cfg = session and session.config
+    if not (cfg and cfg.request == "launch") then
+      return
+    end
+    local adapter_cfg = session.adapter
     local port = adapter_cfg and tonumber(adapter_cfg.port)
     if port then
       kill_child(port)

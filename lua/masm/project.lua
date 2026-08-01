@@ -249,11 +249,15 @@ local SYM_CACHE_CAP = 50000
 ---@return masm.ProjectIndex
 function M.build_index(bufpath)
   local cfg = get_config()
-  -- Deduplicate and drop roots nested under another root, so an extra_roots
-  -- entry inside the project does not index (and later scan) files twice.
-  local candidates = { top_dir(bufpath) }
+  -- Canonicalize every root, then deduplicate and drop roots nested under
+  -- another root, so an extra_roots entry inside the project does not index
+  -- (and later scan) files twice. Walked paths are built by concatenation
+  -- from these roots (and the walk never descends symlinked directories),
+  -- so canonical roots make the WHOLE index canonical -- matching how Neovim
+  -- spells buffer names, which util.loaded_bufnr compares exactly.
+  local candidates = { util.canonical(top_dir(bufpath)) }
   for _, r in ipairs(cfg.extra_roots) do
-    table.insert(candidates, vim.fs.normalize(r))
+    table.insert(candidates, util.canonical(vim.fs.normalize(r)))
   end
   table.sort(candidates, function(a, b)
     return #a < #b

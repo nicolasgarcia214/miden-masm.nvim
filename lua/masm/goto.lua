@@ -381,6 +381,17 @@ end
 ---@field def_name string? definition-site name (symbols only)
 ---@field kw string? defining keyword ("proc"/"const"/"type"; symbols only)
 
+-- Text for a scanned file: the live buffer when one is loaded (unsaved
+-- edits must win everywhere -- for rename they MUST, or collected positions
+-- would not match the buffer the edit lands in), disk otherwise.
+local function file_text(f)
+  local bufnr = util.loaded_bufnr(f)
+  if bufnr then
+    return table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
+  end
+  return read_file(f)
+end
+
 -- Resolves the cursor to a scan target: the ground-truth definition plus
 -- what a project scan needs to recognize it. Returns
 -- { is_symbol, def_path, def_lnum, def_name, kw } or nil and a reason.
@@ -400,11 +411,12 @@ local function reference_target(index, buftext, bufpath)
     def_lnum = tonumber(item.cmd),
   }
   if target.is_symbol then
-    -- def_lnum was resolved against the current buffer's (possibly unsaved)
-    -- text when the definition lives here; the def line must come from the
-    -- same source, or unsaved edits above it would silently make the scan
+    -- def_lnum was resolved with live-buffer-wins semantics (the current
+    -- buffer's possibly-unsaved text, or resolve.file_interface's preference
+    -- for a modified loaded buffer); the def line must come from the same
+    -- source, or unsaved edits above it would silently make the scan
     -- describe whatever symbol sits on that disk line instead.
-    local def_text = (target.def_path == bufpath and buftext) or read_file(target.def_path) or ""
+    local def_text = (target.def_path == bufpath and buftext) or file_text(target.def_path) or ""
     local def_line = vim.split(def_text, "\n")[target.def_lnum] or ""
     target.kw, target.def_name = strip_pub(def_line):match("^(%a+)%s+(" .. util.IDENT .. ")")
     if not target.def_name then
@@ -412,17 +424,6 @@ local function reference_target(index, buftext, bufpath)
     end
   end
   return target
-end
-
--- Text for a scanned file: the live buffer when one is loaded (unsaved
--- edits must win everywhere -- for rename they MUST, or collected positions
--- would not match the buffer the edit lands in), disk otherwise.
-local function file_text(f)
-  local bufnr = util.loaded_bufnr(f)
-  if bufnr then
-    return table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
-  end
-  return read_file(f)
 end
 
 -- Cooperative scan driver. A references() scan visits every indexed file;
@@ -884,6 +885,10 @@ end
 ---@return (fun(target: string, kind: string?): masm.TagItem?, string?)? resolver
 ---@return string? reason
 function M.make_resolver(bufpath, buftext)
+  -- Callers (masm.stack, tests) pass explicit paths that need not match how
+  -- Neovim spells buffer names; canonicalize so index paths and same-file
+  -- comparisons agree with the buffer side (see util.canonical).
+  bufpath = util.canonical(bufpath)
   local ok, index = pcall(project.build_index, bufpath)
   if not ok then
     return nil, "indexing failed: " .. tostring(index)

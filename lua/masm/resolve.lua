@@ -130,6 +130,19 @@ function M.each_selective_use(code, pub_only, fn)
   end
 end
 
+-- The accepted single-line `use` forms, shared between parse_imports (which
+-- consumes the captures) and unrecognized_imports' drift canary (which only
+-- needs the match): one definition means the two cannot drift apart. Alias
+-- positions use util.IDENT (`$`-inclusive); the module-path charset stays
+-- [%w_:] deliberately -- it matches whole paths. All three are anchored at
+-- both ends: a `use` line with trailing junk is not an import, it is drift
+-- for the canary to report.
+local USE_AS = "^use%s+([%w_:]+)%s+as%s+(" .. util.IDENT .. ")%s*$"
+-- Legacy arrow-alias form from the pre-`as` dialect (the pinned tree-sitter
+-- grammar's import_alias rule still spells it this way).
+local USE_ARROW = "^use%s+([%w_:]+)%s*%-%>%s*(" .. util.IDENT .. ")%s*$"
+local USE_PLAIN = "^use%s+([%w_:]+)%s*$"
+
 -- Collects the import maps of a buffer's text:
 --   mods:  local qualifier -> module path segments   (use a::b [as x])
 --   syms:  local name -> { mod = segments, orig = original name }
@@ -167,17 +180,12 @@ function M.parse_imports(text)
       ls = ls - 1
     end
     local l = strip_pub(text:sub(ls, le - 1))
-    -- Alias positions use util.IDENT (`$`-inclusive); the module-path
-    -- charset stays [%w_:] deliberately -- it matches whole paths, and the
-    -- canary patterns in unrecognized_imports mirror it exactly.
-    local mod, alias = l:match("^use%s+([%w_:]+)%s+as%s+(" .. util.IDENT .. ")")
+    local mod, alias = l:match(USE_AS)
     if not mod then
-      -- Legacy arrow-alias form from the pre-`as` dialect (the pinned
-      -- tree-sitter grammar's import_alias rule still spells it this way).
-      mod, alias = l:match("^use%s+([%w_:]+)%s*%-%>%s*(" .. util.IDENT .. ")")
+      mod, alias = l:match(USE_ARROW)
     end
     if not mod then
-      mod = l:match("^use%s+([%w_:]+)%s*$")
+      mod = l:match(USE_PLAIN)
       if mod then
         local segs = split_path(mod)
         alias = segs[#segs]
@@ -232,12 +240,11 @@ function M.unrecognized_imports(text)
     local lnum = track(ls)
     local l = strip_pub(raw)
     if l:match("^use%f[^%w_]") and not covered[lnum] then
-      -- These must mirror parse_imports' accepted forms exactly (alias
-      -- positions util.IDENT, path positions [%w_:]), or a parsed import
-      -- would be reported as drift (and vice versa).
-      local recognized = l:match("^use%s+[%w_:]+%s+as%s+" .. util.IDENT .. "%s*$")
-        or l:match("^use%s+[%w_:]+%s*%-%>%s*" .. util.IDENT .. "%s*$")
-        or l:match("^use%s+[%w_:]+%s*$")
+      -- The exact patterns parse_imports accepts, so a parsed import is
+      -- never reported as drift (and vice versa).
+      local recognized = l:match(USE_AS)
+        or l:match(USE_ARROW)
+        or l:match(USE_PLAIN)
         -- The opening line of a selective use whose braces close on a LATER
         -- line: covered[] only has statements whose braces closed; an
         -- unclosed-because-still-being-typed block should not flap between
@@ -361,7 +368,7 @@ end
 -- `false` for "none" -- and a hit revalidates that cheaply: a remembered
 -- buffer still valid, loaded and named `path` IS the buffer, because Neovim
 -- forbids two buffers sharing a name; a remembered "none" is reconfirmed by
--- bufexists(), an exact-name lookup at C speed (never bufnr()'s pattern
+-- bufloaded(), an exact-name lookup at C speed (never bufnr()'s pattern
 -- matching -- see util.loaded_bufnr). Only when either answer changed (the
 -- buffer was wiped or renamed, or a buffer for `path` appeared) does the
 -- full walk run again.
@@ -379,7 +386,12 @@ function M.file_interface(path, index)
     and vim.api.nvim_buf_get_name(b) == path
   then
     bufnr = b
-  elseif b == false and vim.fn.bufexists(path) == 0 then
+  elseif b == false and vim.fn.bufloaded(path) == 0 then
+    -- bufloaded, not bufexists: a :bdelete'd buffer still EXISTS (unloaded),
+    -- and bufexists == 1 for it would demote every later hit to the full
+    -- walk -- permanently, since the walk keeps re-finding "none". Loaded-ness
+    -- is the exact property util.loaded_bufnr tests, at the same exact-name
+    -- C-speed lookup as bufexists.
     bufnr = nil
   else
     bufnr = util.loaded_bufnr(path)

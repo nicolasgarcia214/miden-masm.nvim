@@ -1,0 +1,28 @@
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+
+# Release Please creates and labels its release PR, then creates the tag and
+# GitHub release when that PR is merged.
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+# Do not let closely spaced pushes race while they update the same release PR.
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
+        with:
+          # A fine-grained token makes the generated PR run normal PR checks.
+          # GITHUB_TOKEN is sufficient when that behavior is not required.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}

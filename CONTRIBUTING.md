@@ -195,3 +195,29 @@ The most useful bug report contains:
 
 If it can be expressed as a fixture case, even better: a failing test in
 `tests/masm_test.lua` is the fastest path to a fix.
+
+## Commits and releases
+
+Use [Conventional Commit](https://www.conventionalcommits.org/) prefixes.
+`feat:` produces a minor release, `fix:` produces a patch release, and a
+`!` suffix or `BREAKING CHANGE:` footer marks a breaking release. While the
+project is below 1.0, breaking changes bump the minor version rather than
+declaring 1.0 automatically. The existing Gitmoji after the prefix is fine;
+for example, `fix(stack): 🐛 reject an invalid immediate` is parsed as a fix.
+
+Release Please runs after pushes to `main` and maintains one release PR. That
+PR updates `version.txt`, `.release-please-manifest.json`, and `CHANGELOG.md`.
+Merge it when the accumulated changes are ready to publish; the following
+workflow run creates the `vX.Y.Z` tag and GitHub release. Do not edit the two
+version files by hand.
+
+For the initial automated `1.0.0` release only, reconcile the hand-written
+`Unreleased` section already in `CHANGELOG.md` with the generated entry before
+merging. Releases after that are generated entirely from commit messages.
+
+The workflow can use the built-in `GITHUB_TOKEN`, provided the repository's
+Actions settings allow GitHub Actions to create pull requests. To also run the
+normal pull-request workflows when the release PR is opened or updated, add a
+fine-grained `RELEASE_PLEASE_TOKEN` repository secret with Contents,
+Pull requests, and Issues read/write access; events created with the built-in
+token do not start further workflow runs.

@@ -190,6 +190,36 @@ check(
 )
 dap._kill()
 
+-- SIGTERM is advisory: a backend that ignores it (ignored signals stay
+-- ignored across exec, so the sleep below is genuinely TERM-immune) must
+-- still be reaped by the escalation SIGKILL after the grace period.
+dap._kill_escalate_ms = 100
+res = wait_result({
+  cmd = "sh",
+  args = { "-c", 'trap "" TERM; echo "DAP server listening"; exec sleep 30' },
+}, nil, 5001)
+check("escalate: TERM-immune backend ready", res == "ready", tostring(res))
+local stubborn_pid = dap._children[5001].handle:get_pid()
+dap._kill(5001)
+local reaped = vim.wait(3000, function()
+  return uv.kill(stubborn_pid, 0) ~= 0 -- ESRCH once the process is gone
+end, 50)
+check("escalate: SIGKILL fallback reaps a TERM-immune backend", reaped)
+dap._kill_escalate_ms = nil
+
+-- Dead-key outputs are retained for post-kill diagnosis but bounded: ports
+-- are kernel-assigned per launch, so without eviction a long session grows
+-- one capped buffer per dead key forever. FIFO over dead keys: the oldest
+-- fall out, the newest stay readable.
+local all_ready = true
+for i = 1, 10 do
+  all_ready = all_ready and wait_result(ready_spec, nil, 6000 + i) == "ready"
+  dap._kill(6000 + i)
+end
+check("retire: ten sequential launches all ready", all_ready)
+check("retire: oldest dead outputs evicted", dap._output(6001) == nil and dap._output(6002) == nil)
+check("retire: newest dead outputs retained", dap._output(6010) ~= nil)
+
 res = wait_result({ cmd = "sh", args = { "-c", "echo nope; exit 3" } })
 check(
   "adapter: early exit reported",
@@ -266,9 +296,24 @@ check(
   vim.inspect(attach_result)
 )
 
--- The uiState listener feeds :MasmDapState.
-stub.listeners.after["event_miden/uiState"]["masm"](nil, { cycle = 7, current_stack = {} })
-check("adapter fn: uiState captured", dap2._ui_state ~= nil and dap2._ui_state.cycle == 7)
+-- The uiState listener feeds :MasmDapState, keyed per SESSION: concurrent
+-- sessions each keep their own pushed state, and ending one session (even
+-- an attach session) clears only its own -- a sibling still stopped at a
+-- breakpoint keeps its state.
+local sess_a = { config = { request = "attach" }, adapter = { port = 11 } }
+local sess_b = { config = { request = "attach" }, adapter = { port = 12 } }
+stub.listeners.after["event_miden/uiState"]["masm"](sess_a, { cycle = 7, current_stack = {} })
+stub.listeners.after["event_miden/uiState"]["masm"](sess_b, { cycle = 9, current_stack = {} })
+local state_a, state_b = dap2._ui_state(sess_a), dap2._ui_state(sess_b)
+check(
+  "adapter fn: uiState kept per session",
+  state_a ~= nil and state_a.cycle == 7 and state_b ~= nil and state_b.cycle == 9
+)
+stub.listeners.after.event_terminated["masm"](sess_a)
+check(
+  "adapter fn: ending one session clears only its own state",
+  dap2._ui_state(sess_a) == nil and dap2._ui_state(sess_b) ~= nil
+)
 
 -- Launch-setup failure must resume nvim-dap's suspended coroutine with nil
 -- (its adapter validation aborts on it), never leave the callback uncalled.

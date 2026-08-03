@@ -57,6 +57,7 @@ local M = {}
 ---@field severity '"error"'|'"warn"'|'"hint"'
 ---@field code string e.g. "exit-depth", "comment-stale", "abi-16"
 ---@field message string
+---@field target string? publish-time dedup key (callee-unresolved only)
 
 ---@class masm.StackProc a scanned (and possibly analyzed) procedure
 ---@field name string
@@ -236,9 +237,11 @@ end
 -- Diagnostics
 ---------------------------------------------------------------------------
 
-local function diag(ctx, lnum, severity, code, message)
+-- `target` marks the diagnostic for publish-time per-target dedup
+-- (callee-unresolved only; see analyze_lines).
+local function diag(ctx, lnum, severity, code, message, target)
   ctx.proc.diagnostics[#ctx.proc.diagnostics + 1] =
-    { lnum = lnum, col = 0, severity = severity, code = code, message = message }
+    { lnum = lnum, col = 0, severity = severity, code = code, message = message, target = target }
 end
 
 ---------------------------------------------------------------------------
@@ -519,24 +522,31 @@ function M.clear_cache()
   contract_memo:clear()
 end
 
--- Scanned procs (declarations + doc contracts) of an on-disk file, cached
--- under its freshness key.
+-- Scanned procs (declarations + doc contracts) of a callee file, cached
+-- under its live-buffer-wins content key (util.content_key). Live-buffer-
+-- wins is not optional here: the resolver that produced the line numbers
+-- this scan is indexed by reads a modified buffer's LIVE text
+-- (resolve.file_interface), so reading disk instead made an unsaved callee
+-- edit either serve a stale contract or -- when the edit shifted lines --
+-- miss the declaration entirely and report a "no procedure declaration"
+-- hint about a line where one is plainly visible.
 local function file_procs(path)
-  local key = util.stat_key(path)
+  local hit = contract_cache:get(path)
+  local key, read_bufnr, found = util.content_key(path, hit and hit.bufnr)
   if not key then
     return nil, "cannot stat " .. path
   end
-  local hit = contract_cache:get(path)
   if hit and hit.key == key then
+    hit.bufnr = found
     return hit.procs
   end
-  local text = util.read_file(path)
+  local text = util.content_text(path, read_bufnr)
   if not text then
     return nil, "cannot read " .. path
   end
   local lines = vim.split(text, "\n", { plain = true })
   local procs = scan_procs(lines, blank_lines(lines))
-  contract_cache:put(path, { key = key, procs = procs })
+  contract_cache:put(path, { key = key, bufnr = found, procs = procs })
   return procs
 end
 
@@ -677,24 +687,26 @@ local function callee_contract(ctx, target, kind)
   return contract, reason
 end
 
--- Raw lines of an on-disk file for constant-definition lookups, cached
--- under the file's freshness key like every other callee lookup (an
--- analysis pass may resolve many `push.CONST`s against the same module).
+-- Raw lines of a file for constant-definition lookups, cached under the
+-- same live-buffer-wins content key as file_procs (an analysis pass may
+-- resolve many `push.CONST`s against the same module, and the resolved
+-- definition line is a LIVE line when that module's buffer is modified).
 local function file_lines_cached(path)
-  local key = util.stat_key(path)
+  local hit = lines_cache:get(path)
+  local key, read_bufnr, found = util.content_key(path, hit and hit.bufnr)
   if not key then
     return nil, "cannot stat " .. path
   end
-  local hit = lines_cache:get(path)
   if hit and hit.key == key then
+    hit.bufnr = found
     return hit.lines
   end
-  local text = util.read_file(path)
+  local text = util.content_text(path, read_bufnr)
   if not text then
     return nil, "cannot read " .. path
   end
   local lines = vim.split(text, "\n", { plain = true })
-  lines_cache:put(path, { key = key, lines = lines })
+  lines_cache:put(path, { key = key, bufnr = found, lines = lines })
   return lines
 end
 
@@ -1051,32 +1063,21 @@ local function apply_op(state, tok, ctx, lnum)
       local why = reason
         or (contract and (contract.inputs_reason or contract.outputs_reason))
         or "no Inputs/Outputs contract"
-      -- The callee-unresolved hint is deduplicated ACROSS procedures via
-      -- shared reported_callees, so whether this proc emits it depends on
-      -- what earlier procs did. Record that pass-order coupling on the dep:
-      -- `rb` (was it already reported when consulted) must still hold for a
-      -- memo hit to be sound, and `claimed` lets a hit re-mark the target so
-      -- later procs in the same pass dedupe exactly as a cold pass would.
-      local dep = ctx.deps and ctx.deps[#ctx.deps]
-      if dep then
-        dep.rb = ctx.reported_callees[imm] == true
-      end
-      if not ctx.reported_callees[imm] then
-        ctx.reported_callees[imm] = true
-        if dep then
-          dep.claimed = true
-        end
-        diag(
-          ctx,
-          lnum,
-          "hint",
-          "callee-unresolved",
-          ("cannot determine stack effect of exec.%s (%s); analysis resumes at the next `# => [...]` comment"):format(
-            imm,
-            why
-          )
-        )
-      end
+      -- Emitted per exec SITE, tagged with the target; analyze_lines keeps
+      -- only the first per target at publish time. Emitting unconditionally
+      -- keeps every proc's outcome a pure function of its own source and
+      -- lookups -- no cross-proc reporting state for the memo to replay.
+      diag(
+        ctx,
+        lnum,
+        "hint",
+        "callee-unresolved",
+        ("cannot determine stack effect of exec.%s (%s); analysis resumes at the next `# => [...]` comment"):format(
+          imm,
+          why
+        ),
+        imm
+      )
       poison(state, ("exec.%s: %s"):format(imm, why))
       return true
     end
@@ -1935,11 +1936,6 @@ local function deps_fresh(deps, shared)
   -- on a validation failure nothing may leak into the pass-wide accounting
   -- -- the re-analysis performs the real raw lookups and counts them itself.
   local counted_new = {}
-  -- Claims this proc itself made, in dep order: a proc with TWO execs of
-  -- the same unresolved callee recorded rb=false then rb=true, and the
-  -- second must be checked against the state as of the first (shared
-  -- reported_callees is only updated after the whole proc validates).
-  local claimed = {}
   for _, dep in ipairs(deps) do
     -- The budget guard is replayed here (not inside the lookup): the
     -- current answer for a given target is pass-constant and memoized in
@@ -1970,18 +1966,6 @@ local function deps_fresh(deps, shared)
     end
     if sig_now ~= dep.sig then
       return false
-    end
-    -- Pass-order coupling of the callee-unresolved hint (see apply_op):
-    -- the hint's presence/absence in the cached diagnostics is only valid
-    -- if the target's reported state is the same as when it was analyzed.
-    if dep.rb ~= nil then
-      local reported = shared.reported_callees[dep.target] == true or claimed[dep.target] == true
-      if reported ~= dep.rb then
-        return false
-      end
-      if dep.claimed then
-        claimed[dep.target] = true
-      end
     end
   end
   shared.lookups = vctx.lookups
@@ -2020,7 +2004,7 @@ end
 -- snapshots are shared by reference: cells are immutable by design (see the
 -- module header) and nothing mutates a state after analysis. Diagnostics
 -- are copied when shifted so the cached originals keep their coordinates.
-local function restore_proc(proc, snap, shared)
+local function restore_proc(proc, snap)
   local delta = proc.lnum - snap.lnum
   proc.exit = snap.exit
   proc.bailed = snap.bailed
@@ -2044,15 +2028,10 @@ local function restore_proc(proc, snap, shared)
         severity = d.severity,
         code = d.code,
         message = d.message,
+        target = d.target,
       }
     end
     proc.diagnostics = diags
-  end
-  -- Replay the hint claims so later procs in this pass dedupe identically.
-  for _, dep in ipairs(snap.deps) do
-    if dep.claimed then
-      shared.reported_callees[dep.target] = true
-    end
   end
 end
 
@@ -2091,12 +2070,17 @@ function M.analyze_lines(lines, path)
     -- targets that already drew it this pass. Reads through ctx's __index
     -- land here, so all procs of a pass share one tally.
     counted = {},
-    reported_callees = {},
     -- Per-pass memo of current lookup signatures (deps_fresh): validation
     -- asks about the same callee once per DEPENDENT proc, but the answer
     -- within one pass is the same every time.
     val_memo = {},
   }
+  -- Publish-time dedup of target-tagged hints (callee-unresolved): analysis
+  -- emits one per exec site so per-proc outcomes stay pass-order independent
+  -- (see apply_op); the published result keeps only the FIRST site per
+  -- distinct target, in file order -- exactly the shape in-analysis dedup
+  -- used to produce, without the cross-proc state it made the memo replay.
+  local seen_targets = {}
   for _, proc in ipairs(local_procs.list) do
     local key = proc_cache_key(path, lines, proc)
     local hit = key and proc_cache:get(key) or nil
@@ -2104,7 +2088,7 @@ function M.analyze_lines(lines, path)
       -- deps_fresh already synced shared.lookups, keeping the pass budget
       -- in lockstep with what a cold pass would have consumed here.
       M._memo_stats.hits = M._memo_stats.hits + 1
-      restore_proc(proc, hit, shared)
+      restore_proc(proc, hit)
     else
       M._memo_stats.misses = M._memo_stats.misses + 1
       local ctx = setmetatable({ proc = proc, deps = {} }, { __index = shared })
@@ -2115,7 +2099,12 @@ function M.analyze_lines(lines, path)
       end
     end
     for _, d in ipairs(proc.diagnostics) do
-      result.diagnostics[#result.diagnostics + 1] = d
+      if d.target == nil or not seen_targets[d.target] then
+        if d.target ~= nil then
+          seen_targets[d.target] = true
+        end
+        result.diagnostics[#result.diagnostics + 1] = d
+      end
     end
   end
   -- Full tiebreak: table.sort is unstable, and same-line diagnostics would

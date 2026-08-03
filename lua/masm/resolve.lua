@@ -352,74 +352,29 @@ end
 --
 -- A MODIFIED loaded buffer wins over the disk file (unsaved edits must be
 -- seen -- most visibly, navigation must follow a just-applied rename while
--- its edits sit unsaved for review); its freshness key is the changedtick,
--- since a disk mtime cannot see buffer edits. A clean buffer stays on the
--- disk path: its content matches the file it was read from, and the disk
--- may since have moved on (out-of-editor edits must keep tracking, which
--- the stale-cache tests pin). The two key formats cannot collide, so
--- sym_cache entries validated through this key re-resolve on either kind
--- of change.
---
--- FINDING that buffer is the expensive part: util.loaded_bufnr walks every
--- buffer (two API calls each), and paying that on every cache hit made hit
--- cost scale with the session's buffer count (measured 7.9x on warm
--- resolution with ~200 unrelated buffers open; scripts/bench.lua asserts on
--- the ratio now). So each entry remembers the buffer it last saw -- or
--- `false` for "none" -- and a hit revalidates that cheaply: a remembered
--- buffer still valid, loaded and named `path` IS the buffer, because Neovim
--- forbids two buffers sharing a name; a remembered "none" is reconfirmed by
--- bufloaded(), an exact-name lookup at C speed (never bufnr()'s pattern
--- matching -- see util.loaded_bufnr). Only when either answer changed (the
--- buffer was wiped or renamed, or a buffer for `path` appeared) does the
--- full walk run again.
+-- its edits sit unsaved for review); a clean buffer stays on the disk path
+-- (out-of-editor edits must keep tracking, which the stale-cache tests
+-- pin). Key formats, the changedtick-vs-stat choice and the cheap
+-- remembered-buffer revalidation all live in util.content_key -- shared
+-- with the stack analyzer's contract/constant caches, which index into
+-- line numbers THIS interface resolves and must therefore read the same
+-- text.
 ---@param path string
 ---@param index masm.ProjectIndex
 ---@return masm.FileInterface
 function M.file_interface(path, index)
   local entry = index.file_cache:get(path)
-  local bufnr
-  local b = entry and entry.bufnr
-  if
-    b
-    and vim.api.nvim_buf_is_valid(b)
-    and vim.api.nvim_buf_is_loaded(b)
-    and vim.api.nvim_buf_get_name(b) == path
-  then
-    bufnr = b
-  elseif b == false and vim.fn.bufloaded(path) == 0 then
-    -- bufloaded, not bufexists: a :bdelete'd buffer still EXISTS (unloaded),
-    -- and bufexists == 1 for it would demote every later hit to the full
-    -- walk -- permanently, since the walk keeps re-finding "none". Loaded-ness
-    -- is the exact property util.loaded_bufnr tests, at the same exact-name
-    -- C-speed lookup as bufexists.
-    bufnr = nil
-  else
-    bufnr = util.loaded_bufnr(path)
-  end
-  -- Remember what the walk (or revalidation) found, independent of the
-  -- modified state: a clean buffer must stay remembered so its later edits
-  -- are seen without another walk.
-  local found = bufnr or false
-  if bufnr and not vim.bo[bufnr].modified then
-    bufnr = nil
-  end
-  local key
-  if bufnr then
-    key = "b:" .. bufnr .. ":" .. vim.api.nvim_buf_get_changedtick(bufnr)
-  else
-    key = util.stat_key(path) or "?"
-  end
+  local key, read_bufnr, found = util.content_key(path, entry and entry.bufnr)
+  key = key or "?"
   if entry and entry.key == key then
+    -- Remember what the revalidation found, independent of the modified
+    -- state: a clean buffer must stay remembered so its later edits are
+    -- seen without another walk.
     entry.bufnr = found
     return entry
   end
   entry = { key = key, bufnr = found, defs = {}, kinds = {}, reexports = {} }
-  local text
-  if bufnr then
-    text = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
-  else
-    text = util.read_file(path)
-  end
+  local text = util.content_text(path, read_bufnr)
   if text then
     local lnum = 0
     for line in text:gmatch("([^\n]*)\n?") do

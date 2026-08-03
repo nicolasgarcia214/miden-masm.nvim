@@ -347,7 +347,11 @@ function M.file_written(path)
   if path == "" then
     return
   end
-  path = vim.fs.normalize(path)
+  -- Canonicalized exactly like the roots it is compared against (build_index
+  -- realpaths them): buffer names keep whatever spelling a file was opened
+  -- with, so a save through a symlinked project dir arrives with the alias
+  -- spelling and would otherwise never match a root prefix.
+  path = util.canonical(vim.fs.normalize(path))
   local manifest = vim.fs.basename(path) == "miden-project.toml"
   for key, index in pairs(cache.data) do
     for _, root in ipairs(index.roots) do

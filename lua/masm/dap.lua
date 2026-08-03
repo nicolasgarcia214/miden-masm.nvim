@@ -177,15 +177,50 @@ local function close_pipes(c)
   end
 end
 
+-- Ports are kernel-assigned per launch, so without retirement a long
+-- session accumulates one capped output buffer per dead key, unboundedly.
+-- Retention is deliberate (error paths kill the child FIRST and read its
+-- output after), so eviction is FIFO over dead keys, not immediate.
+local MAX_DEAD_OUTPUTS = 8
+local dead_keys = {}
+local function retire_output(key)
+  dead_keys[#dead_keys + 1] = key
+  while #dead_keys > MAX_DEAD_OUTPUTS do
+    local k = table.remove(dead_keys, 1)
+    if not children[k] then -- the key may have been relaunched since
+      outputs[k] = nil
+    end
+  end
+end
+
+-- TERM first, KILL if the process is still around after the grace period:
+-- TERM is advisory, and a wedged backend (mid-proof-generation with the
+-- signal masked, say) would otherwise survive as an orphan the plugin has
+-- already forgotten. The handle closes in the spawn exit callback, so
+-- is_closing() doubles as "already exited" here.
+local KILL_ESCALATE_MS = 2000
+-- Test hook (the `_underscore` convention): the real grace period would
+-- make the escalation path cost seconds per test. nil means the default.
+M._kill_escalate_ms = nil
 local function kill_child(key)
   local c = children[key]
   if not c then
     return
   end
   children[key] = nil
+  retire_output(key)
   close_pipes(c)
   if c.handle and not c.handle:is_closing() then
     c.handle:kill("sigterm")
+    local timer = uv.new_timer()
+    if timer then
+      timer:start(M._kill_escalate_ms or KILL_ESCALATE_MS, 0, function()
+        timer:close()
+        if not c.handle:is_closing() then
+          c.handle:kill("sigkill")
+        end
+      end)
+    end
   end
 end
 
@@ -279,6 +314,7 @@ function M._start_adapter(spec, on_done, timeout_ms, key)
     local c = children[key]
     if c and c.handle == handle then
       children[key] = nil
+      retire_output(key)
       close_pipes(c)
     end
     if handle then
@@ -333,9 +369,20 @@ end
 local registered = false
 
 -- The most recent `miden/uiState` push (cycle, operand stack, call stack)
--- from the adapter; the VS Code extension renders this in a tree view, here
--- :MasmDapState shows it in a float.
-M._ui_state = nil
+-- per SESSION: concurrent sessions each keep their own, :MasmDapState shows
+-- the current session's (the VS Code extension renders the same push in a
+-- tree view). Weak keys, so a session nvim-dap drops without firing any
+-- cleanup event cannot pin its state forever.
+local ui_states = setmetatable({}, { __mode = "k" })
+
+-- The registered nvim-dap module, captured by register(): show_state asks
+-- it which session is current.
+local dap_mod
+
+-- Test hook: the state recorded for `session`, if any.
+function M._ui_state(session)
+  return ui_states[session]
+end
 
 -- Failure paths resume nvim-dap's suspended coroutine with nil (which its
 -- adapter validation rejects and aborts on) instead of never calling
@@ -389,11 +436,13 @@ local function render_state(state)
 end
 
 local function show_state()
-  if not M._ui_state then
+  local session = dap_mod and dap_mod.session and dap_mod.session()
+  local state = session and ui_states[session]
+  if not state then
     vim.notify("masm dap: no VM state (is a miden debug session stopped?)", vim.log.levels.WARN)
     return
   end
-  local lines = render_state(M._ui_state)
+  local lines = render_state(state)
   local buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].bufhidden = "wipe"
@@ -471,14 +520,20 @@ function M.register()
     }
   end
 
-  dap.listeners.after["event_miden/uiState"]["masm"] = function(_, body)
-    M._ui_state = body
+  dap_mod = dap
+  dap.listeners.after["event_miden/uiState"]["masm"] = function(session, body)
+    if session then
+      ui_states[session] = body
+    end
   end
-  -- Kill only the ENDING session's backend (looked up by its adapter port):
-  -- concurrent sessions each own one, and killing "the" child tore down
-  -- whichever session launched last.
+  -- Kill only the ENDING session's backend (looked up by its adapter port),
+  -- and drop only ITS recorded VM state: concurrent sessions each own one
+  -- of each, and clearing "the" state blanked a sibling still stopped at a
+  -- breakpoint.
   local function cleanup(session)
-    M._ui_state = nil
+    if session then
+      ui_states[session] = nil
+    end
     -- Only LAUNCH sessions own a backend. An attach session's target on
     -- that port can be a sibling launch's live backend (nothing else could
     -- have bound the port our child owns), and its disconnect must not

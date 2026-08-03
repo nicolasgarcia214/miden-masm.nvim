@@ -34,19 +34,21 @@ M.IDENT_FRONTIER = "%f[^" .. M.IDENT_CHARS .. "]"
 -- MASM path and line helpers
 ---------------------------------------------------------------------------
 
--- Splits `a::b::c` into segments. A single `:` is not a MASM path separator
--- (the assembler rejects `a:b`); treating it as one would happily resolve
--- code that does not compile, so malformed paths yield zero segments and
--- resolution reports "not found" downstream.
+-- Splits `a::b::c` into segments. Only exact `::` separators are accepted
+-- (the assembler rejects `a:b`, `a::::b`, leading/trailing `::`); treating
+-- any other colon spelling as a separator would happily resolve code that
+-- does not compile, so malformed paths yield zero segments and resolution
+-- reports "not found" downstream. Enforced by round-trip: the segments must
+-- reassemble to exactly the given path.
 ---@param path string
 ---@return string[] segs empty when the path is malformed
 function M.split_path(path)
-  if path:gsub("::", ""):find(":", 1, true) then
-    return {}
-  end
   local segs = {}
   for seg in path:gmatch("[^:]+") do
     table.insert(segs, seg)
+  end
+  if table.concat(segs, "::") ~= path then
+    return {}
   end
   return segs
 end
@@ -208,12 +210,14 @@ end
 -- Hardened file access
 ---------------------------------------------------------------------------
 
--- Canonical (symlink-resolved) spelling of a path. Neovim resolves symlinks
--- when it names buffers, so every path the plugin compares against a buffer
--- name -- index roots and the paths walked from them, explicit caller-passed
--- buffer paths -- must be canonicalized the same way, or the two spellings
--- of one file (macOS's /var vs /private/var is the everyday case) break the
--- exact-name buffer matching that live-buffer-wins resolution rides on.
+-- Canonical (symlink-resolved) spelling of a path. Paths reach the plugin
+-- in whatever spelling their producer used: buffer names keep the spelling
+-- a file was opened with, while cwd/tempname expansion resolves links
+-- (macOS's /var vs /private/var is the everyday case). Every path the
+-- plugin COMPARES against another -- index roots and the paths walked from
+-- them, caller-passed buffer paths, BufWritePost paths -- must go through
+-- this first, or two spellings of one file break the exact-name matching
+-- that live-buffer-wins resolution and index invalidation ride on.
 ---@param path string
 ---@return string canonical the resolved path, or `path` unchanged when it
 ---  cannot be resolved (nonexistent files keep their given spelling)
@@ -283,6 +287,72 @@ function M.loaded_bufnr(path)
       return b
     end
   end
+end
+
+-- The loaded buffer named `path`, revalidating a REMEMBERED answer cheaply.
+-- loaded_bufnr walks every buffer, and paying that on every cache hit makes
+-- hit cost scale with the session's buffer count (measured: 7.9x on warm
+-- resolution with ~200 unrelated buffers open; scripts/bench.lua asserts on
+-- the ratio). `last` is what the previous walk found -- a bufnr, or false
+-- for "none": a remembered buffer still valid, loaded and named `path` IS
+-- the buffer (Neovim forbids two buffers sharing a name); a remembered
+-- "none" is reconfirmed by bufloaded(), an exact-name lookup at C speed
+-- (never bufexists -- a :bdelete'd buffer still EXISTS unloaded and would
+-- demote every later hit to the full walk, permanently). Only when either
+-- answer changed does the full walk run again.
+---@param path string
+---@param last integer|false|nil previously found bufnr; false = none
+---@return integer? bufnr
+function M.revalidate_bufnr(path, last)
+  if
+    last
+    and vim.api.nvim_buf_is_valid(last)
+    and vim.api.nvim_buf_is_loaded(last)
+    and vim.api.nvim_buf_get_name(last) == path
+  then
+    return last
+  end
+  if last == false and vim.fn.bufloaded(path) == 0 then
+    return nil
+  end
+  return M.loaded_bufnr(path)
+end
+
+-- Live-buffer-wins freshness key for a file's CONTENT, shared by every
+-- cache whose entries must match what resolution reads: a MODIFIED loaded
+-- buffer keys on its changedtick (a disk mtime cannot see buffer edits) and
+-- must also be read from the buffer; a clean or absent one keys on -- and
+-- reads -- disk, so out-of-editor edits keep tracking. The two key formats
+-- cannot collide. One producer for key AND text keeps consumers (symbol
+-- resolution, the analyzer's contract/constant lookups) reading the same
+-- bytes their line numbers were resolved against.
+---@param path string
+---@param last integer|false|nil remembered bufnr (see revalidate_bufnr)
+---@return string? key nil when the file is unstatable and no modified buffer serves it
+---@return integer? read_bufnr non-nil only for a modified loaded buffer
+---@return integer|false found what the buffer lookup saw, for the cache entry to remember
+function M.content_key(path, last)
+  local bufnr = M.revalidate_bufnr(path, last)
+  local found = bufnr or false
+  if bufnr and not vim.bo[bufnr].modified then
+    bufnr = nil
+  end
+  if bufnr then
+    return "b:" .. bufnr .. ":" .. vim.api.nvim_buf_get_changedtick(bufnr), bufnr, found
+  end
+  return M.stat_key(path), nil, found
+end
+
+-- The text content_key's answer described: the modified buffer's live lines
+-- when it returned a read_bufnr, the bounded hardened disk read otherwise.
+---@param path string
+---@param read_bufnr integer?
+---@return string? text
+function M.content_text(path, read_bufnr)
+  if read_bufnr then
+    return table.concat(vim.api.nvim_buf_get_lines(read_bufnr, 0, -1, false), "\n")
+  end
+  return M.read_file(path)
 end
 
 ---------------------------------------------------------------------------

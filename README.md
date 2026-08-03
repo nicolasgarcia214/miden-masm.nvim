@@ -284,7 +284,9 @@ Honest list, so you know what you are getting:
 - The project index is one bounded directory walk. It is built by the first
   stack-analysis pass, scheduled a moment after the first `.masm` buffer
   opens (stack analysis is on by default); with `vim.g.masm_no_stack` set,
-  it is built synchronously on the first jump instead. References and
+  it is built synchronously by whichever feature needs it first — a jump,
+  or the first `<C-x><C-o>` completion, which then pays the walk while you
+  are typing. References and
   rename scans read every loaded buffer's
   live text (falling back to disk); references run time-sliced in the
   background, while rename deliberately scans synchronously so its

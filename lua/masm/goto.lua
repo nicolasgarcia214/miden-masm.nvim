@@ -261,10 +261,15 @@ end
 -- Collects every usage in `text` (one file) that resolves to the definition
 -- at (def_path, def_lnum) whose definition-site name is `def_name`. Renamed
 -- re-exports are handled by resolving each candidate, not by name matching.
--- `add` receives (file, lnum, col, raw_line, spelled_name, name_col):
--- `spelled_name` is the last path segment actually written at the site and
--- `name_col` its 1-based column -- rename() needs both to rewrite exactly
--- the sites that spell the definition name, leaving aliases alone.
+-- `add` receives (file, lnum, col, raw_line, spelled_name, name_col,
+-- shadowable): `spelled_name` is the last path segment actually written at
+-- the site and `name_col` its 1-based column -- rename() needs both to
+-- rewrite exactly the sites that spell the definition name, leaving aliases
+-- alone. `shadowable` is true for sites that resolve through the file's
+-- LOCAL names (bare tokens): rewriting one into a file where the new name
+-- already means something would silently change what it resolves to, which
+-- is why rename refuses that (qualified `mod::name` and kernel-routed
+-- `syscall.name` sites resolve elsewhere and cannot be shadowed).
 local function collect_symbol_refs(f, text, def_path, def_lnum, def_name, index, add)
   local mods, syms = resolve.parse_imports(text)
   -- Local names in this file that resolve to the definition.
@@ -302,7 +307,7 @@ local function collect_symbol_refs(f, text, def_path, def_lnum, def_name, index,
             local p, l = resolve.find_symbol(mf, segs[#segs], index, 0)
             if p == def_path and l == def_lnum then
               local name = segs[#segs]
-              add(f, lnum, s, raw, name, s + #tok - #name)
+              add(f, lnum, s, raw, name, s + #tok - #name, false)
             end
           end
         end
@@ -330,7 +335,7 @@ local function collect_symbol_refs(f, text, def_path, def_lnum, def_name, index,
           or use_lines[lnum]
           or line:match("^%s*@")
         then
-          add(f, lnum, s, raw, tok, s)
+          add(f, lnum, s, raw, tok, s, true)
         end
       elseif line:sub(1, s - 1):match("([%w_]+)%.$") == "syscall" then
         -- `syscall.name` needs no import; resolve against the kernel library.
@@ -338,7 +343,7 @@ local function collect_symbol_refs(f, text, def_path, def_lnum, def_name, index,
           if lib.kernel then
             local p, l = resolve.find_symbol(lib.root_file, tok, index, 0)
             if p == def_path and l == def_lnum then
-              add(f, lnum, s, raw, tok, s)
+              add(f, lnum, s, raw, tok, s, false)
             end
           end
         end
@@ -383,10 +388,18 @@ end
 
 -- Text for a scanned file: the live buffer when one is loaded (unsaved
 -- edits must win everywhere -- for rename they MUST, or collected positions
--- would not match the buffer the edit lands in), disk otherwise.
-local function file_text(f)
+-- would not match the buffer the edit lands in), disk otherwise. When
+-- `ticks` is given, the changedtick of every buffer read is recorded in it
+-- at the moment of the read -- the async references scan uses this to
+-- detect buffers edited under an in-flight scan (see scan_stale).
+---@param f string
+---@param ticks table<integer, integer>?
+local function file_text(f, ticks)
   local bufnr = util.loaded_bufnr(f)
   if bufnr then
+    if ticks then
+      ticks[bufnr] = vim.api.nvim_buf_get_changedtick(bufnr)
+    end
     return table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
   end
   return read_file(f)
@@ -434,6 +447,12 @@ end
 -- Starting a new scan cancels the one in flight.
 local active_scan
 local SCAN_SLICE_MS = 10
+-- How many times a completed async scan is redone from scratch when a
+-- buffer it read was edited mid-flight. One restart handles the realistic
+-- case (the user typed while a big scan ran); the bound only guarantees a
+-- pathological editing loop terminates in a warning instead of scanning
+-- forever.
+local MAX_SCAN_RESTARTS = 3
 
 -- Test hook (see stackview's `_diag_ns` convention): the slice length is
 -- otherwise an unreachable local, and the fixture project scans in well under
@@ -456,7 +475,7 @@ local function run_scan(scan)
     end
     local f = scan.files[scan.i]
     scan.i = scan.i + 1
-    local text = file_text(f)
+    local text = file_text(f, scan.ticks)
     if text then
       -- One unreadable or pathological file must not kill the whole scan.
       if not pcall(scan.visit, f, text) then
@@ -483,7 +502,34 @@ local function start_scan(scan)
   end
   scan.i = 1
   scan.errors = 0
+  scan.ticks = {}
   run_scan(scan)
+end
+
+-- Whether any buffer the scan read was edited (or wiped) after the read.
+-- Collected positions describe the text at read time; an async scan yields
+-- to the event loop between slices, so user edits can shift lines under
+-- items already collected -- a stale scan's results must not be published.
+local function scan_stale(scan)
+  for bufnr, tick in pairs(scan.ticks) do
+    if not vim.api.nvim_buf_is_valid(bufnr) or vim.api.nvim_buf_get_changedtick(bufnr) ~= tick then
+      return true
+    end
+  end
+  return false
+end
+
+-- Re-verifies that the target's definition line still declares its name --
+-- shared by rename (an async prompt may have intervened between resolution
+-- and application) and the references scan's stale-restart (a mid-scan edit
+-- may have moved the definition itself).
+---@param target masm.ReferenceTarget
+local function target_current(target)
+  if not target.is_symbol then
+    return true
+  end
+  local def_line = vim.split(file_text(target.def_path) or "", "\n")[target.def_lnum] or ""
+  return strip_pub(def_line):match("^%a+%s+(" .. util.IDENT .. ")") == target.def_name
 end
 
 local function sort_ref_items(items, target)
@@ -548,6 +594,20 @@ function M.references(opts)
       end
     end,
     on_done = function()
+      -- An async scan interleaves with user input: when a buffer it read
+      -- was edited before completion, redo the whole scan (fresh reads see
+      -- the new text) rather than publish a mix of pre- and post-edit
+      -- positions. Bounded; gives up loudly, never silently wrong.
+      if not scan.sync and scan_stale(scan) then
+        scan.restarts = (scan.restarts or 0) + 1
+        if scan.restarts <= MAX_SCAN_RESTARTS and target_current(target) then
+          items, seen = {}, {}
+          start_scan(scan)
+          return
+        end
+        vim.notify("masm references: buffers changed while scanning; rerun", vim.log.levels.WARN)
+        return
+      end
       if scan.errors > 0 then
         vim.notify(
           "masm references: failed to scan " .. scan.errors .. " file(s)",
@@ -598,7 +658,11 @@ local function collect_import_item_edits(f, text, target, index, add)
           -- (brace_open is the `{` itself).
           local abs = stmt.brace_open + item_pos + name_off - 1
           local lnum, line_start = line_of(abs)
-          add(f, lnum, abs - line_start + 1)
+          -- An un-aliased item binds the original as the LOCAL name (the
+          -- same `orig as alias` pattern each_use_item recognizes), so the
+          -- rewritten name is shadowable; an aliased item keeps its alias.
+          local aliased = item:match(util.IDENT .. "%s+as%s+" .. util.IDENT) ~= nil
+          add(f, lnum, abs - line_start + 1, not aliased)
         end
       end
     end
@@ -636,31 +700,21 @@ local function apply_rename(bufpath, target, new_name)
   -- Time (an async prompt, at least) may have passed since the target was
   -- resolved: verify the definition line still declares that name, or the
   -- scan below would describe whatever now sits on it.
-  local def_text = file_text(target.def_path) or ""
-  local def_line = vim.split(def_text, "\n")[target.def_lnum] or ""
-  if strip_pub(def_line):match("^%a+%s+(" .. util.IDENT .. ")") ~= target.def_name then
+  if not target_current(target) then
     vim.notify(
       "masm rename: definition changed since it was resolved; aborted",
       vim.log.levels.WARN
     )
     return nil, "definition moved"
   end
-  -- Renaming onto an existing sibling definition would silently merge the
-  -- two names (every old-name site would resolve to the survivor).
-  if resolve.find_def_line(def_text, new_name) then
-    vim.notify(
-      "masm rename: "
-        .. new_name
-        .. " is already defined in "
-        .. vim.fs.basename(target.def_path)
-        .. "; aborted",
-      vim.log.levels.WARN
-    )
-    return nil, "name collision"
-  end
-
   -- Collect edit positions: (file, lnum, 1-based col of the old name).
-  local edits, seen = {}, {}
+  -- `shadowed` accumulates files where a shadowable site (see
+  -- collect_symbol_refs) would be rewritten while `new_name` already has a
+  -- meaning in that file's scope -- applying such an edit would silently
+  -- merge the two names (every old-name site would resolve to the
+  -- survivor), so rename refuses below. Probed inside visit, on the text
+  -- the scan already has in hand.
+  local edits, seen, shadowed = {}, {}, {}
   local function add(f, lnum, col)
     local key = f .. ":" .. lnum .. ":" .. col
     if not seen[key] then
@@ -669,11 +723,25 @@ local function apply_rename(bufpath, target, new_name)
       table.insert(edits[f], { lnum, col })
     end
   end
+  -- Does `new_name` already mean something in this file's scope: its own
+  -- definition, or an import binding it as the local name?
+  local function name_taken(text)
+    if resolve.find_def_line(text, new_name) then
+      return true
+    end
+    local _, syms = resolve.parse_imports(text)
+    return syms[new_name] ~= nil
+  end
   local scan
   scan = {
     files = index.masm,
     sync = true,
     visit = function(f, text)
+      local shadowable_here = false
+      local function collect(sf, lnum, col, shadowable)
+        shadowable_here = shadowable_here or shadowable == true
+        add(sf, lnum, col)
+      end
       collect_symbol_refs(
         f,
         text,
@@ -681,13 +749,16 @@ local function apply_rename(bufpath, target, new_name)
         target.def_lnum,
         target.def_name,
         index,
-        function(sf, lnum, _, _, name, name_col)
+        function(sf, lnum, _, _, name, name_col, shadowable)
           if name == target.def_name then
-            add(sf, lnum, name_col)
+            collect(sf, lnum, name_col, shadowable)
           end
         end
       )
-      collect_import_item_edits(f, text, target, index, add)
+      collect_import_item_edits(f, text, target, index, collect)
+      if shadowable_here and name_taken(text) then
+        shadowed[#shadowed + 1] = f
+      end
     end,
     on_done = function() end,
   }
@@ -698,6 +769,17 @@ local function apply_rename(bufpath, target, new_name)
       vim.log.levels.ERROR
     )
     return nil, "scan failed"
+  end
+  if #shadowed > 0 then
+    local where = vim.fs.basename(shadowed[1])
+    if #shadowed > 1 then
+      where = where .. (" and %d more file(s)"):format(#shadowed - 1)
+    end
+    vim.notify(
+      "masm rename: " .. new_name .. " already has a meaning in " .. where .. "; aborted",
+      vim.log.levels.WARN
+    )
+    return nil, "name collision"
   end
 
   -- Apply bottom-up so earlier edits cannot shift later positions, verifying

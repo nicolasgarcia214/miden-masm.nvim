@@ -1022,6 +1022,249 @@ check(
 )
 
 ---------------------------------------------------------------------------
+-- engine: positional shuffles move the RIGHT cells (names, not just depth)
+---------------------------------------------------------------------------
+
+-- Felt-granular index shuffling is the module's core design premise, so
+-- each hand-written shuffle is pinned by its full output permutation over
+-- named inputs -- an off-by-one in any of them fails here instead of
+-- silently corrupting name tracking (and every downstream comment-stale/
+-- comment-reordered diagnostic) in the field.
+local function names_after(op, inputs)
+  local sres = analyze_virtual({
+    "#! Invocation: exec",
+    "#! Inputs:  [" .. inputs .. "]",
+    "#! Outputs: [" .. inputs .. "]",
+    "proc shuffle_probe",
+    "    " .. op,
+    "end",
+  })
+  local p = sres and sres.procs[1]
+  if not p or p.bailed or not p.exit or p.exit.poisoned then
+    return "unavailable: " .. tostring(p and (p.bailed or (p.exit and p.exit.poisoned)))
+  end
+  local out = {}
+  for _, c in ipairs(p.exit.cells) do
+    out[#out + 1] = c.name or "?"
+  end
+  return table.concat(out, " ")
+end
+
+local W8 = "a, b, c, d, e, f, g, h"
+local W12 = W8 .. ", i, j, k, l"
+local W16 = W12 .. ", m, n, o, p"
+for _, case in ipairs({
+  { "swap", "a, b", "b a" },
+  { "swap.3", "a, b, c, d", "d b c a" },
+  { "movup.2", "a, b, c, d", "c a b d" },
+  { "movup.15", W16, "p a b c d e f g h i j k l m n o" },
+  { "movdn.2", "a, b, c, d", "b c a d" },
+  { "movdn.15", W16, "b c d e f g h i j k l m n o p a" },
+  { "dup", "a, b", "a a b" },
+  { "dup.1", "a, b", "b a b" },
+  { "dupw.1", W8, "e f g h a b c d e f g h" },
+  { "swapw.1", W8, "e f g h a b c d" },
+  { "swapw.3", W16, "m n o p e f g h i j k l a b c d" },
+  { "swapdw", W16, "i j k l m n o p a b c d e f g h" },
+  { "movupw.2", W12, "i j k l a b c d e f g h" },
+  { "movupw.3", W16, "m n o p a b c d e f g h i j k l" },
+  { "movdnw.2", W12, "e f g h i j k l a b c d" },
+  { "movdnw.3", W16, "e f g h i j k l m n o p a b c d" },
+  { "reversew", "a, b, c, d", "d c b a" },
+  { "reversedw", W8, "h g f e d c b a" },
+}) do
+  local got = names_after(case[1], case[2])
+  check("shuffle: " .. case[1] .. " permutes exactly", got == case[3], got)
+end
+
+---------------------------------------------------------------------------
+-- engine: callee-unresolved dedup happens at publish time, per target
+---------------------------------------------------------------------------
+
+-- Two procs exec'ing the same unresolved callee publish ONE hint (the first
+-- site in file order); a distinct target publishes its own. Per-proc
+-- results stay pass-order independent: each proc's own diagnostics carry
+-- its own hint, only the published file result is deduplicated.
+local dedup_src = {
+  "#! Invocation: exec",
+  "#! Inputs:  []",
+  "#! Outputs: []",
+  "proc first_caller",
+  "    exec.nowhere::missing",
+  "    # => []",
+  "end",
+  "",
+  "#! Invocation: exec",
+  "#! Inputs:  []",
+  "#! Outputs: []",
+  "proc second_caller",
+  "    exec.nowhere::missing",
+  "    # => []",
+  "end",
+  "",
+  "#! Invocation: exec",
+  "#! Inputs:  []",
+  "#! Outputs: []",
+  "proc other_caller",
+  "    exec.nowhere::other",
+  "    # => []",
+  "end",
+}
+vres = analyze_virtual(dedup_src)
+local hint_lines = {}
+for _, d in ipairs(vres and vres.diagnostics or {}) do
+  if d.code == "callee-unresolved" then
+    hint_lines[#hint_lines + 1] = d.lnum
+  end
+end
+check(
+  "hint dedup: one published hint per distinct target, first site wins",
+  vres ~= nil and #hint_lines == 2 and hint_lines[1] == 5 and hint_lines[2] == 21,
+  vim.inspect(hint_lines)
+)
+check(
+  "hint dedup: every proc keeps its own hint (pass-order independent)",
+  vres ~= nil
+    and #vres.procs[1].diagnostics == 1
+    and #vres.procs[2].diagnostics == 1
+    and vres.procs[2].diagnostics[1].code == "callee-unresolved",
+  vres and vim.inspect(vres.procs[2].diagnostics) or "no result"
+)
+
+-- The memo interaction the old in-analysis dedup made fragile: edit only
+-- the SECOND caller (first is a memo hit, second re-analyzes) and the
+-- warm result must be bit-identical to a cold pass over the same content.
+local dedup_edited = vim.deepcopy(dedup_src)
+table.insert(dedup_edited, 14, "    push.1 drop")
+local warm_edited = analyze_virtual(dedup_edited)
+stack.clear_cache()
+local cold_edited = analyze_virtual(dedup_edited)
+check(
+  "hint dedup: warm pass after a partial edit equals the cold pass",
+  vim.deep_equal(warm_edited, cold_edited),
+  vim.inspect(warm_edited and warm_edited.diagnostics)
+)
+
+---------------------------------------------------------------------------
+-- engine: cross-file lookups are live-buffer-wins, like resolution
+---------------------------------------------------------------------------
+
+-- The resolver reads a MODIFIED loaded buffer's live text and returns live
+-- line numbers; the analyzer's contract and constant lookups must read the
+-- same text. Reading disk here served a stale contract after an unsaved
+-- callee edit -- and when the edit shifted lines, missed the declaration
+-- entirely and reported a hint about a line where one is plainly visible.
+local reg_path = here .. "/fixtures/core_lib/registry.masm"
+local live_caller = {
+  "use fix::core::registry",
+  "",
+  "#! Invocation: exec",
+  "#! Inputs:  [s, p]",
+  "#! Outputs: [VALUE]",
+  "proc live_caller",
+  "    exec.registry::get_item",
+  "end",
+}
+local const_caller = {
+  "use {VALUE_SLOT} from fix::core::registry",
+  "",
+  "#! Invocation: exec",
+  "#! Inputs:  []",
+  "#! Outputs: [SLOT]",
+  "proc const_caller",
+  "    push.VALUE_SLOT",
+  "end",
+}
+-- Baselines against the clean disk fixture -- analyzed for real (not
+-- bailed), so nothing below can pass vacuously.
+stack.clear_cache()
+vres = analyze_virtual(live_caller)
+check(
+  "live callee: contract baseline is clean",
+  vres ~= nil and vres.procs[1].bailed == nil and codes_of(vres) == "",
+  vres and (tostring(vres.procs[1].bailed) .. " " .. codes_of(vres)) or "no result"
+)
+vres = analyze_virtual(const_caller)
+check(
+  "live callee: constant baseline is clean",
+  vres ~= nil and vres.procs[1].bailed == nil and codes_of(vres) == "",
+  vres and (tostring(vres.procs[1].bailed) .. " " .. codes_of(vres)) or "no result"
+)
+
+local prev_buf = vim.api.nvim_get_current_buf()
+vim.cmd("edit! " .. reg_path)
+local reg_buf = vim.api.nvim_get_current_buf()
+local function reg_line_of(frag)
+  for i, l in ipairs(vim.api.nvim_buf_get_lines(reg_buf, 0, -1, false)) do
+    if l:find(frag, 1, true) then
+      return i
+    end
+  end
+end
+local live_ok, live_err = pcall(function()
+  -- An unsaved edit that SHIFTS the declaration: the resolved (live) line
+  -- must land on the live declaration, not miss on the disk line.
+  vim.api.nvim_buf_set_lines(reg_buf, 0, 0, false, { "# live pad", "# live pad" })
+  vres = analyze_virtual(live_caller)
+  check(
+    "live callee: shifted unsaved declaration still resolves",
+    vres ~= nil and codes_of(vres) == "",
+    codes_of(vres)
+  )
+  -- An unsaved edit to the CONTRACT: the caller analyzes against the live
+  -- Outputs, exactly as a cold pass over saved files would.
+  local outputs_lnum = assert(reg_line_of("#! Outputs: [VALUE]"))
+  vim.api.nvim_buf_set_lines(
+    reg_buf,
+    outputs_lnum - 1,
+    outputs_lnum,
+    false,
+    { "#! Outputs: [VALUE, extra]" }
+  )
+  vres = analyze_virtual(live_caller)
+  check(
+    "live callee: unsaved contract edit reaches the caller",
+    vres ~= nil and codes_of(vres):find("exec%-net") ~= nil,
+    codes_of(vres)
+  )
+  -- Completion summaries ride the same lookup: live line, live contract.
+  local summary = stack.contract_summary(reg_path, assert(reg_line_of("pub proc get_item")))
+  check(
+    "live callee: completion summary reflects the live buffer",
+    summary == "[slot_id_suffix, slot_id_prefix] -> [VALUE, extra]",
+    tostring(summary)
+  )
+  -- Constants too: the live definition decides the pushed width.
+  local slot_lnum = assert(reg_line_of("pub const VALUE_SLOT"))
+  vim.api.nvim_buf_set_lines(
+    reg_buf,
+    slot_lnum - 1,
+    slot_lnum,
+    false,
+    { "pub const VALUE_SLOT = 7" }
+  )
+  vres = analyze_virtual(const_caller)
+  check(
+    "live callee: unsaved constant edit reaches the caller",
+    vres ~= nil and codes_of(vres):find("exec%-net") ~= nil,
+    codes_of(vres)
+  )
+end)
+vim.api.nvim_buf_call(reg_buf, function()
+  vim.cmd("edit!") -- discard every unsaved fixture edit
+end)
+vim.api.nvim_set_current_buf(prev_buf)
+check("live callee: block completed", live_ok, tostring(live_err))
+-- Reverted: the next pass reads the clean disk contract again (the
+-- changedtick-keyed entries cannot linger past the revert).
+vres = analyze_virtual(live_caller)
+check(
+  "live callee: revert restores the clean baseline",
+  vres ~= nil and codes_of(vres) == "",
+  codes_of(vres)
+)
+
+---------------------------------------------------------------------------
 -- engine: the lookup budget counts distinct targets, not raw calls
 ---------------------------------------------------------------------------
 
@@ -1253,6 +1496,61 @@ check(
 )
 stackview.detach(bufnr)
 vim.cmd("edit!") -- drop the injected line so later suites see the fixture as on disk
+
+-- Failure notices latch on the MESSAGE, not a boolean: a repeat of the same
+-- failure stays quiet, but a DIFFERENT failure notifies even while an
+-- earlier one is latched, and a change back re-arms the first.
+local latch_notified = {}
+local latch_saved_notify = vim.notify
+-- Replacing the typed built-in is the point of the stub; restored below.
+---@diagnostic disable-next-line: duplicate-set-field
+vim.notify = function(msg)
+  latch_notified[#latch_notified + 1] = tostring(msg)
+end
+local latch_ok, latch_err = pcall(function()
+  local function count(frag)
+    local n = 0
+    for _, m in ipairs(latch_notified) do
+      if m:find(frag, 1, true) then
+        n = n + 1
+      end
+    end
+    return n
+  end
+  local lbuf = vim.api.nvim_create_buf(false, true) -- unnamed: analysis refuses
+  stackview.attach(lbuf)
+  stackview.refresh(lbuf)
+  stackview.refresh(lbuf)
+  check(
+    "latch: repeated failure notifies once",
+    count("unnamed buffer") == 1,
+    vim.inspect(latch_notified)
+  )
+  -- A different failure (size cap fires before the name check) must not be
+  -- swallowed by the latched one.
+  vim.api.nvim_buf_set_lines(lbuf, 0, -1, false, { string.rep("x", 3 * 1024 * 1024) })
+  stackview.refresh(lbuf)
+  check(
+    "latch: a new, different failure still notifies",
+    count("too large") == 1,
+    vim.inspect(latch_notified)
+  )
+  -- ...and flipping back re-arms the first message. Replaced with real
+  -- content, not `{}`: clearing a buffer to empty leaves
+  -- nvim_buf_get_offset's total stale (a Neovim memline quirk), which
+  -- would keep the size check tripping here.
+  vim.api.nvim_buf_set_lines(lbuf, 0, -1, false, { "# small again" })
+  stackview.refresh(lbuf)
+  check(
+    "latch: reverting re-arms the earlier message",
+    count("unnamed buffer") == 2,
+    vim.inspect(latch_notified)
+  )
+  stackview.detach(lbuf)
+  vim.api.nvim_buf_delete(lbuf, { force = true })
+end)
+vim.notify = latch_saved_notify
+check("latch: block completed", latch_ok, tostring(latch_err))
 
 -- The autocmd-driven pipeline end to end: a TextChanged firing must reach
 -- publish() through the debounce timer (tests above call refresh() directly,

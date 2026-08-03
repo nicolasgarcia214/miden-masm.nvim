@@ -814,6 +814,30 @@ check(
   tostring(col_why)
 )
 
+-- The same silent merge, one file over: app/main.masm defines LOCAL_LIMIT
+-- and spells MAX_VALUE bare (import item, push.MAX_VALUE), so renaming
+-- MAX_VALUE onto LOCAL_LIMIT would shadow main's own constant at those
+-- sites even though the DEFINING file has no such name.
+place("app/main.masm", "push.MAX_VALUE", 5)
+local xcol_res, xcol_why = goto_mod.rename("LOCAL_LIMIT")
+check(
+  "rename: refuses collision in a referencing file",
+  xcol_res == nil and xcol_why == "name collision",
+  tostring(xcol_why)
+)
+
+-- Control: the guard is per TOUCHED file, not a project-wide name ban.
+-- `run` is defined in gadget.masm, which neither references MAX_VALUE nor
+-- is touched by the rename; the rename must go through.
+place("app/main.masm", "push.MAX_VALUE", 5)
+local far_res, far_why = goto_mod.rename("run")
+check(
+  "rename: name defined only in untouched files is allowed",
+  far_res ~= nil and far_res.applied > 0,
+  far_res ~= nil and vim.inspect(far_res) or tostring(far_why)
+)
+restore_modified_buffers()
+
 -- Async-prompt capture: with a vim.ui.input that moves the cursor before
 -- submitting (what an async dressing/snacks prompt amounts to), the symbol
 -- captured at prompt time is renamed -- not whatever the cursor lands on.

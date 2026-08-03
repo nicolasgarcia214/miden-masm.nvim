@@ -136,6 +136,26 @@ local run_ok, run_err = pcall(function()
   check("read_file: directory refused", util.read_file(rdir) == nil)
 
   -------------------------------------------------------------------------
+  -- util.split_path: only exact `::` separators are accepted
+  -------------------------------------------------------------------------
+
+  -- Positive controls first, so the refusals below cannot pass vacuously.
+  check(
+    "split_path: well-formed path splits",
+    vim.deep_equal(util.split_path("a::b::c"), { "a", "b", "c" })
+  )
+  check("split_path: single segment splits", vim.deep_equal(util.split_path("a"), { "a" }))
+  -- Every non-`::` colon spelling is refused: the assembler rejects all of
+  -- these, and resolving one would navigate code that does not compile.
+  for _, bad in ipairs({ "a:b", "a:::b", "a::::b", "::a::b", "a::b::", ":", "::" }) do
+    check(
+      ("split_path: malformed `%s` yields zero segments"):format(bad),
+      #util.split_path(bad) == 0,
+      vim.inspect(util.split_path(bad))
+    )
+  end
+
+  -------------------------------------------------------------------------
   -- project walk: symlinked directories are never descended
   -------------------------------------------------------------------------
 
@@ -179,6 +199,19 @@ local run_ok, run_err = pcall(function()
     cidx.masm_set[canon_root .. "/helper.masm"] == true
       and cidx.masm_set[alias_root .. "/helper.masm"] == nil,
     vim.inspect(cidx.masm)
+  )
+  -- ...and a save reported through the alias spelling must still invalidate:
+  -- buffer names keep the spelling a file was opened with, so BufWritePost
+  -- can hand file_written the alias path while the index roots are canonical.
+  write_file(canon_root .. "/late.masm", "pub proc late\n    push.1 drop\nend\n")
+  project.file_written(alias_root .. "/late.masm")
+  local cidx2 = with_notify(function()
+    return project.build_index(alias_root .. "/main.masm")
+  end)
+  check(
+    "walk: alias-spelled write invalidates the canonical index",
+    cidx2.masm_set[canon_root .. "/late.masm"] == true,
+    vim.inspect(cidx2.masm)
   )
   vim.fn.delete(alias_root)
 
@@ -396,6 +429,45 @@ local run_ok, run_err = pcall(function()
     landed and qf_title():find("MAX_VALUE", 1, true) ~= nil,
     qf_title()
   )
+  vim.cmd("cclose")
+
+  -- Mid-scan buffer edit: an async scan whose source buffers change while
+  -- it is in flight must never publish pre-edit line numbers (the stale
+  -- scan redoes itself with fresh reads). The edit lands while the scan is
+  -- provably still running; whether main.masm had been read before or
+  -- after it, the published item must match the POST-edit buffer.
+  vim.fn.setqflist({}, " ", { title = "sentinel3", items = {} })
+  place("app/main.masm", "push.MAX_VALUE", 5)
+  local main_buf = vim.api.nvim_get_current_buf()
+  goto_mod.references()
+  check("stale: scan is in flight before the edit", qf_title() == "sentinel3", qf_title())
+  vim.api.nvim_buf_set_lines(main_buf, 0, 0, false, { "# mid-scan edit shifting every line" })
+  landed = vim.wait(5000, function()
+    return qf_title() ~= "sentinel3"
+  end, 5)
+  check("stale: edited scan still completes", landed, qf_title())
+  local push_lnum
+  for i, l in ipairs(vim.api.nvim_buf_get_lines(main_buf, 0, -1, false)) do
+    if l:find("push.MAX_VALUE", 1, true) then
+      push_lnum = i
+      break
+    end
+  end
+  local published_lnum
+  for _, it in ipairs(vim.fn.getqflist()) do
+    local name = vim.api.nvim_buf_get_name(it.bufnr)
+    if name:find("app/main.masm", 1, true) and it.text:find("push.MAX_VALUE", 1, true) then
+      published_lnum = it.lnum
+    end
+  end
+  check(
+    "stale: published position matches the post-edit buffer",
+    published_lnum ~= nil and published_lnum == push_lnum,
+    ("qf %s vs buffer %s"):format(tostring(published_lnum), tostring(push_lnum))
+  )
+  vim.api.nvim_buf_call(main_buf, function()
+    vim.cmd("edit!") -- discard the mid-scan edit for later suites
+  end)
   vim.cmd("cclose")
   goto_mod._scan_slice_ms = nil
 

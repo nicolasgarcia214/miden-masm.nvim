@@ -50,12 +50,12 @@ vim.api.nvim_create_autocmd("ColorScheme", {
 local MAX_BUF_BYTES = 2 * 1024 * 1024
 
 -- Per-buffer state:
--- { timer, overlay (bool), notified (bool), analyzed_tick (changedtick at
+-- { timer, overlay (bool), notified (string), analyzed_tick (changedtick at
 --   the last successful publish; the debounced path's early-out key) }.
 ---@class masm.StackViewState
 ---@field timer uv.uv_timer_t? debounce timer (nil only after detach)
 ---@field overlay boolean ghost-text overlay currently enabled
----@field notified boolean? a too-large/failed notice was already shown
+---@field notified string? the failure notice currently shown, if any
 ---@field analyzed_tick integer? changedtick at the last successful publish
 ---@field analyzed_cfg masm.StackViewConfig? config that produced that publish
 
@@ -265,11 +265,18 @@ function M.refresh(bufnr)
     return
   end
   local cfg = get_config()
-  if vim.api.nvim_buf_get_offset(bufnr, vim.api.nvim_buf_line_count(bufnr)) > MAX_BUF_BYTES then
-    if not state.notified then
-      state.notified = true
-      vim.notify("masm stack: buffer too large, analysis disabled", vim.log.levels.WARN)
+  -- Failure notices run from edit-driven autocmds, so each is shown once --
+  -- but latched on the MESSAGE, not a boolean: a new, different failure
+  -- must never be swallowed because an old one already notified, and a
+  -- recovery (successful publish clears the latch below) re-arms it.
+  local function notify_once(msg)
+    if state.notified ~= msg then
+      state.notified = msg
+      vim.notify(msg, vim.log.levels.WARN)
     end
+  end
+  if vim.api.nvim_buf_get_offset(bufnr, vim.api.nvim_buf_line_count(bufnr)) > MAX_BUF_BYTES then
+    notify_once("masm stack: buffer too large, analysis disabled")
     return
   end
   -- One buffer read serves the whole refresh: the analysis, the drift
@@ -302,10 +309,7 @@ function M.refresh(bufnr)
     -- Unnamed buffer or index failure: clear our output, say why once.
     vim.diagnostic.reset(diag_ns, bufnr)
     vim.api.nvim_buf_clear_namespace(bufnr, mark_ns, 0, -1)
-    if not state.notified then
-      state.notified = true
-      vim.notify("masm stack: " .. reason, vim.log.levels.WARN)
-    end
+    notify_once("masm stack: " .. reason)
     return
   end
   local drift = require("masm.goto").unrecognized_imports(table.concat(lines, "\n"))
@@ -323,6 +327,7 @@ function M.refresh(bufnr)
   -- early-out).
   state.analyzed_tick = tick
   state.analyzed_cfg = cfg
+  state.notified = nil -- recovered: the next failure (even a repeat) notifies
 end
 
 ---@param bufnr integer

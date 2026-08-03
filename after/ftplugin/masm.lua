@@ -130,7 +130,13 @@ local undo = "setl commentstring< comments< iskeyword< tagfunc< omnifunc<"
   .. " | exe 'silent! nunmap <buffer> K'"
   .. " | silent! delcommand -buffer MasmRename"
   .. " | silent! delcommand -buffer MasmRebuildIndex"
-  .. " | silent! call v:lua.require'masm.stackview'.detach()"
-  .. " | silent! delcommand -buffer MasmStackToggle"
+-- Guarded like the attach above: with the zero-cost opt-out set, nothing
+-- was wired, and the teardown must not be the thing that loads the
+-- analyzer module for the first time.
+if not vim.g.masm_no_stack then
+  undo = undo
+    .. " | silent! call v:lua.require'masm.stackview'.detach()"
+    .. " | silent! delcommand -buffer MasmStackToggle"
+end
 local base = vim.b.undo_ftplugin
 vim.b.undo_ftplugin = (base and base ~= "" and base .. " | " or "") .. undo

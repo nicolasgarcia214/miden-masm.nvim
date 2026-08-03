@@ -528,7 +528,9 @@ Deletions, moves and out-of-editor changes need |:MasmRebuildIndex|.
 - The project index is one bounded directory walk. It is built by the
   first stack-analysis pass, scheduled a moment after the first `.masm`
   buffer opens (stack analysis is on by default); with |g:masm_no_stack|
-  set it is built synchronously on the first jump instead. Reference scans
+  set it is built synchronously by whichever feature needs it first -- a
+  jump, or the first CTRL-X CTRL-O completion, which then pays the walk
+  while you are typing. Reference scans
   and renames read files as they go, so a very large `extra_roots` still
   costs time -- but references do not block the UI while scanning.
 - Rename rewrites the definition-site spelling everywhere it appears; it

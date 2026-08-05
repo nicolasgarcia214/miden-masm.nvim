@@ -129,6 +129,13 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/).
   `exp.u`; a library directory literally named `foo..bar` is no longer
   refused by the manifest containment check.
 
+## [1.0.1](https://github.com/nicolasgarcia214/miden-masm.nvim/compare/v1.0.0...v1.0.1) (2026-08-05)
+
+
+### Bug Fixes
+
+* **hover:** 🐛 give dyncall/dynexec proper instruction docs ([0933ecd](https://github.com/nicolasgarcia214/miden-masm.nvim/commit/0933ecdfcb60e68a0f05b04f7a71ca211eca2297))
+
 ## [1.0.0](https://github.com/nicolasgarcia214/miden-masm.nvim/compare/v0.1.0...v1.0.0) (2026-08-03)
 
 

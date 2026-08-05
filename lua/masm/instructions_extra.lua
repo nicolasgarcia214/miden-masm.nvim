@@ -13,6 +13,8 @@ return {
   { "eqz", "b = 1, if a = 0, and 0 otherwise.", "(a, ...) → (a = 0, ...)" },
   { "nop", "Does nothing (advances the VM one cycle).", "(...) → (...)" },
   { "breakpoint", "Breaks into the debugger when executed under one; a no-op otherwise.", "(...) → (...)" },
+  { "dyncall", "Pops a, reads the word at memory address a as the MAST root of a procedure, and calls it in a new context. The callee sees the top 16 remaining elements; on return the caller-visible stack is exactly 16 elements (the callee's outputs).", "(a, ...) → (16 callee outputs)" },
+  { "dynexec", "Pops a, reads the word at memory address a as the MAST root of a procedure, and executes it in the current context. The callee's stack effect then applies.", "(a, ...) → (callee stack effect)" },
   { "adv_pushw", "Pops a word from the advice stack and pushes it onto the operand stack.", "(...) → (A, ...)" },
   { "reversew", "Reverses the order of the top 4 stack elements.", "(d, c, b, a, ...) → (a, b, c, d, ...)" },
   { "reversedw", "Reverses the order of the top 8 stack elements.", "(h, .., a, ...) → (a, .., h, ...)" },

@@ -27,8 +27,6 @@ local KEYWORDS = {
   "begin",
   "call.",
   "const",
-  "dyncall",
-  "dynexec",
   "else",
   "end",
   "exec.",

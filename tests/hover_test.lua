@@ -76,6 +76,23 @@ res = hover.content()
 check("instruction hover: dotted sub-op found", res ~= nil and res.lines[1] == "adv.insert_mem")
 vim.cmd("edit!") -- drop the scratch line
 
+-- Bare invocation instructions with no dotted target (regression: dyncall
+-- and dynexec were neither resolvable names nor reference entries, so K
+-- reported "no documentation found").
+for _, mnem in ipairs({ "dyncall", "dynexec" }) do
+  vim.cmd("edit! " .. root .. "app/main.masm")
+  vim.api.nvim_buf_set_lines(0, -1, -1, false, { "    " .. mnem })
+  vim.api.nvim_win_set_cursor(0, { vim.api.nvim_buf_line_count(0), 6 })
+  res = hover.content()
+  check(
+    "instruction hover: " .. mnem .. " found",
+    res ~= nil and res.lines[1] == mnem,
+    vim.inspect(res)
+  )
+  check("instruction hover: " .. mnem .. " stack effect shown", has_line(res, "stack: "))
+  vim.cmd("edit!")
+end
+
 -- Cursor exactly on the DOT of an unresolvable dotted operand: NOT on the
 -- mnemonic (regression: an off-by-one counted the dot as the mnemonic's last
 -- column and showed push.{n} family docs for the dot of `push.NO_SUCH`).

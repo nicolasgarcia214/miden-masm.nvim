@@ -129,6 +129,13 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/).
   `exp.u`; a library directory literally named `foo..bar` is no longer
   refused by the manifest containment check.
 
+## [1.1.0](https://github.com/nicolasgarcia214/miden-masm.nvim/compare/v1.0.1...v1.1.0) (2026-08-06)
+
+
+### Features
+
+* **stack:** ✨ add :MasmStackComments project-wide quickfix scan ([41f02dd](https://github.com/nicolasgarcia214/miden-masm.nvim/commit/41f02dd7011d7e5f20f252c95f49438c3a9ffcc8))
+
 ## [1.0.1](https://github.com/nicolasgarcia214/miden-masm.nvim/compare/v1.0.0...v1.0.1) (2026-08-05)
 
 

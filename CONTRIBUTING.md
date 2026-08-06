@@ -88,9 +88,12 @@ fixtures can evolve.
   the dialect-drift canary's unrecognized-import scan. Resolution is
   deliberately text-based; see the header comment before reaching for
   tree-sitter here.
+- `lua/masm/scan.lua` - the narrow cooperative project-file scanner shared
+  by quickfix producers: time slicing, cancellation, live-buffer reads and
+  bounded changedtick-based stale-result retries.
 - `lua/masm/goto.lua` - the public navigation facade over `masm.project`
-  and `masm.resolve`: cursor context, tagfunc, references (the time-sliced
-  scan driver), rename, document symbols, and every documented entry point
+  and `masm.resolve`: cursor context, tagfunc, references, rename, document
+  symbols, and every documented entry point
   (`resolve()`, `make_resolver()`, the import/interface queries other
   modules build on).
 - `lua/masm/complete.lua` - 'omnifunc' completion: context detection plus
@@ -113,7 +116,7 @@ fixtures can evolve.
   instruction reference and the highlight keyword list know them too (fill
   reference gaps in `instructions_extra.lua`).
 - `lua/masm/stackview.lua` - stack-analysis UI: diagnostics publishing,
-  ghost-text overlay, debounce, attach/detach.
+  ghost-text overlay, project-wide comment quickfix, debounce, attach/detach.
 - `lua/masm/instructions.lua` - GENERATED instruction metadata; do not edit.
   Regenerate with `scripts/gen_instructions.py` against a
   [masm-lsp](https://github.com/trailofbits/masm-lsp) checkout when Miden

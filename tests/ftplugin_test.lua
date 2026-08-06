@@ -39,6 +39,7 @@ check("K mapped", buf_mapped("K"))
 check("command exists", vim.fn.exists(":MasmRebuildIndex") == 2)
 check("rename command exists", vim.fn.exists(":MasmRename") == 2)
 check("stack command exists", vim.fn.exists(":MasmStackToggle") == 2)
+check("stack comments command exists", vim.fn.exists(":MasmStackComments") == 2)
 local stack_autocmds = vim.api.nvim_get_autocmds({
   group = "masm_stack_" .. vim.api.nvim_get_current_buf(),
   buffer = vim.api.nvim_get_current_buf(),
@@ -59,6 +60,7 @@ check("teardown: K unmapped", not buf_mapped("K"))
 check("teardown: command removed", vim.fn.exists(":MasmRebuildIndex") == 0)
 check("teardown: rename command removed", vim.fn.exists(":MasmRename") == 0)
 check("teardown: stack command removed", vim.fn.exists(":MasmStackToggle") == 0)
+check("teardown: stack comments command removed", vim.fn.exists(":MasmStackComments") == 0)
 local stackview = require("masm.stackview")
 local buf = vim.api.nvim_get_current_buf()
 check(
@@ -81,6 +83,7 @@ check("opt-out: no gd mapping", not buf_mapped("gd"))
 check("opt-out: no K mapping", not buf_mapped("K"))
 check("opt-out: tagfunc still set", vim.bo.tagfunc:find("masm.goto", 1, true) ~= nil)
 check("opt-out: no stack command", vim.fn.exists(":MasmStackToggle") == 0)
+check("opt-out: no stack comments command", vim.fn.exists(":MasmStackComments") == 0)
 local no_stack_autocmds =
   pcall(vim.api.nvim_get_autocmds, { group = "masm_stack_" .. vim.api.nvim_get_current_buf() })
 check("opt-out: no stack autocmds", not no_stack_autocmds)

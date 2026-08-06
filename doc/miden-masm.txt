@@ -173,6 +173,16 @@ gO                 List the buffer's definitions (procs, consts, types,
 :MasmStackToggle   Toggle the inferred-stack ghost-text overlay for the
                    current buffer. See |miden-masm-stack|.
 
+                                                          *:MasmStackComments*
+:MasmStackComments Scan every indexed `.masm` file for inaccurate handwritten
+                   `# => [...]` comments and populate the quickfix list with
+                   `comment-stale` and `comment-reordered` findings. The scan
+                   is time-sliced in the background, includes
+                   |g:masm_goto| `extra_roots`, and prefers live loaded-buffer
+                   text over disk. Running this explicit check is independent
+                   of |g:masm_stack| `check_comments`, which controls ambient
+                   per-buffer diagnostics only.
+
                                                                *:MasmDapState*
 :MasmDapState      Show the Miden VM state (cycle, operand stack, call
                    stack) most recently pushed by the debug adapter, in a
@@ -264,6 +274,9 @@ tracker get ghost text -- plus lines whose tracker is stale, which show the
 corrected state highlighted with `MasmStackVirtualTextStale`. Highlight
 groups: `MasmStackVirtualText` (links to `NonText`) and
 `MasmStackVirtualTextStale` (links to `DiagnosticVirtualTextWarn`).
+
+Use |:MasmStackComments| to collect the `comment-stale` and
+`comment-reordered` findings from every indexed project file in quickfix.
 
 Analysis runs on |InsertLeave| and normal-mode edits (debounced) and on
 every write, whole-buffer, synchronously and bounded: oversized buffers,
@@ -361,9 +374,11 @@ g:masm_stack       Optional table configuring stack analysis; all fields
 
                                                              *g:masm_no_stack*
 g:masm_no_stack    When true, stack analysis is not wired at all for new
-                   `masm` buffers: no autocmds, no |:MasmStackToggle|, zero
-                   cost. |masm.stackview.attach()| remains callable, so a
-                   per-project autocmd can still opt chosen buffers in.
+                   `masm` buffers: no autocmds, no |:MasmStackToggle| or
+                   |:MasmStackComments|, zero cost.
+                   |masm.stackview.attach()| remains callable, so a
+                   per-project autocmd can still opt chosen buffers in;
+                   |masm.stackview.comments()| remains callable directly.
 
                                                                *g:masm_no_dap*
 g:masm_no_dap      When true, nothing is registered with nvim-dap and
@@ -455,6 +470,17 @@ analyze({bufnr})                                       *masm.stack.analyze()*
     the current content of buffer {bufnr} (nil or 0 means the current
     buffer), with the buffer's file name anchoring resolution. Same return
     convention; an unnamed buffer returns nil and a reason.
+
+comments({opts})                              *masm.stackview.comments()*
+    `require("masm.stackview").comments()` scans every indexed project file
+    for `comment-stale` and `comment-reordered` findings, replaces the
+    quickfix list, and opens it when findings exist. The default scan is
+    asynchronous and time-sliced. Pass `{ sync = true }` to block until done;
+    the sync form also returns the sorted quickfix-style items
+    (`{ filename, lnum, col, type, text }`), or nil when all indexed comments
+    are accurate. Loaded buffers, including unsaved ones, take precedence
+    over disk. This explicit scan is unaffected by
+    |g:masm_stack| `check_comments`.
 
 toggle({bufnr})                                     *masm.stackview.toggle()*
     `require("masm.stackview").toggle()` toggles the inferred-stack

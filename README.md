@@ -52,7 +52,9 @@ static stack analysis, with no language server required.
   `# => [VALUE, pad(16)]`-style state on lines that have no handwritten
   annotation. Comments that list the right elements in the wrong order --
   the swapped-operands documentation bug width checking cannot see -- are
-  flagged whenever both sides are fully named.
+  flagged whenever both sides are fully named. `:MasmStackComments` scans
+  every indexed project file for both kinds of inaccurate comment and opens
+  the findings in quickfix.
 - A dialect-drift canary: resolution is text-based against the current
   dialect's import forms, and a future form the resolver does not recognize
   would otherwise fail silently. Any such `use` statement is published as an
@@ -157,6 +159,10 @@ All mappings are buffer-local to `.masm` files:
   normal-mode edits (debounced) and every write; they render through your
   normal `vim.diagnostic` configuration under the source name `masm-stack`
   (`masm-goto` for the import-form canary).
+- `:MasmStackComments` - scan every indexed `.masm` file for stale or
+  reordered `# => [...]` comments and open the findings in quickfix. The scan
+  runs in the background, includes configured `extra_roots`, and sees unsaved
+  loaded buffers.
 
 ## Debugging
 
@@ -245,7 +251,7 @@ vim.g.masm_stack = {
   debounce_ms = 300, -- delay after edits before re-analysis
 }
 
--- Set this to disable stack analysis entirely (no autocmds, no command).
+-- Set this to disable stack analysis entirely (no autocmds or stack commands).
 vim.g.masm_no_stack = true
 
 -- Set this to keep the plugin away from nvim-dap entirely.

@@ -1679,5 +1679,146 @@ stackview.detach(empty_buf)
 vim.api.nvim_buf_delete(empty_buf, { force = true })
 
 ---------------------------------------------------------------------------
+-- stackview: project-wide inaccurate-comment quickfix
+---------------------------------------------------------------------------
+
+local project = require("masm.project")
+local real_build_index = project.build_index
+local comments_notified = {}
+local comments_saved_notify = vim.notify
+local comment_bufs = {}
+local comments_scanner = require("masm.scan")
+local comments_saved_slice = comments_scanner._slice_ms
+---@diagnostic disable-next-line: duplicate-set-field
+vim.notify = function(msg)
+  comments_notified[#comments_notified + 1] = tostring(msg)
+end
+
+local comments_ok, comments_err = pcall(function()
+  local function scratch(name, lines)
+    local b = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_name(b, here .. "/fixtures/app/" .. name)
+    vim.api.nvim_buf_set_lines(b, 0, -1, false, lines)
+    comment_bufs[#comment_bufs + 1] = b
+    return b, vim.api.nvim_buf_get_name(b)
+  end
+
+  local reordered_buf, reordered_path = scratch("a_reordered_virtual.masm", {
+    "#! Invocation: call",
+    "#! Inputs:  [b, a, pad(14)]",
+    "#! Outputs: [a, b, pad(14)]",
+    "proc reordered",
+    "    swap",
+    "    # => [b, a, pad(14)]",
+    "end",
+  })
+  local stale_buf, stale_path = scratch("z_stale_virtual.masm", {
+    "#! Invocation: call",
+    "#! Inputs:  [pad(16)]",
+    "#! Outputs: [pad(16)]",
+    "proc stale",
+    "    push.1",
+    "    # => [pad(16)]",
+    "    drop",
+    "end",
+  })
+  local missing_path = here .. "/fixtures/app/missing_virtual.masm"
+  local indexed = { stale_path, missing_path, reordered_path } -- deliberately unsorted
+  project.build_index = function()
+    return { masm = indexed }
+  end
+
+  local function run_comments()
+    vim.cmd("silent! cclose")
+    vim.api.nvim_set_current_buf(bufnr)
+    return stackview.comments({ sync = true })
+  end
+
+  -- Explicit project scans ignore the ambient-diagnostic display gate.
+  vim.g.masm_stack = { check_comments = false }
+  local comment_items = run_comments()
+  vim.g.masm_stack = nil
+  check(
+    "comments: both inaccurate-comment codes collected project-wide",
+    comment_items ~= nil
+      and #comment_items == 2
+      and comment_items[1].text:find("[comment-reordered]", 1, true) ~= nil
+      and comment_items[2].text:find("[comment-stale]", 1, true) ~= nil,
+    vim.inspect(comment_items)
+  )
+  check(
+    "comments: findings sorted by file despite index order",
+    comment_items ~= nil
+      and comment_items[1].filename == reordered_path
+      and comment_items[2].filename == stale_path,
+    vim.inspect(comment_items)
+  )
+  local qf = vim.fn.getqflist({ title = 1, items = 1 })
+  check(
+    "comments: quickfix title and warning entries published",
+    qf.title == "MASM inaccurate stack comments"
+      and #qf.items == 2
+      and qf.items[1].type == "W"
+      and qf.items[2].type == "W",
+    vim.inspect(qf)
+  )
+  local partial_notice = false
+  for _, msg in ipairs(comments_notified) do
+    partial_notice = partial_notice or msg:find("results are partial", 1, true) ~= nil
+  end
+  check("comments: unreadable indexed files reported as partial", partial_notice)
+
+  -- The user-facing default must yield instead of blocking on a whole
+  -- project. A tiny slice makes that observable on this small fixture.
+  comments_scanner._slice_ms = 0.05
+  vim.cmd("silent! cclose")
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.fn.setqflist({}, " ", { title = "comments sentinel", items = {} })
+  local async_items = stackview.comments()
+  check(
+    "comments: default scan returns before replacing quickfix",
+    async_items == nil and vim.fn.getqflist({ title = 1 }).title == "comments sentinel"
+  )
+  local async_landed = vim.wait(5000, function()
+    return vim.fn.getqflist({ title = 1 }).title ~= "comments sentinel"
+  end, 5)
+  check("comments: asynchronous scan eventually publishes", async_landed)
+  comments_scanner._slice_ms = comments_saved_slice
+
+  -- Correct the loaded, unsaved buffers. A disk-only scan would either keep
+  -- the findings or fail (these virtual paths do not exist).
+  vim.api.nvim_buf_set_lines(reordered_buf, 5, 6, false, { "    # => [a, b, pad(14)]" })
+  vim.api.nvim_buf_set_lines(stale_buf, 5, 6, false, { "    # => [1, pad(16)]" })
+  indexed = { stale_path, reordered_path }
+  comments_notified = {}
+  local empty_items = run_comments()
+  qf = vim.fn.getqflist({ title = 1, items = 1 })
+  local accurate_notice = false
+  for _, msg in ipairs(comments_notified) do
+    accurate_notice = accurate_notice
+      or msg:find("all indexed stack comments are accurate", 1, true) ~= nil
+  end
+  check("comments: live unsaved corrections win over disk", empty_items == nil)
+  check(
+    "comments: zero findings clear stale quickfix results",
+    qf.title == "MASM inaccurate stack comments" and #qf.items == 0,
+    vim.inspect(qf)
+  )
+  check("comments: zero findings notify success", accurate_notice)
+end)
+
+vim.cmd("silent! cclose")
+project.build_index = real_build_index
+vim.notify = comments_saved_notify
+vim.g.masm_stack = nil
+comments_scanner._slice_ms = comments_saved_slice
+for _, b in ipairs(comment_bufs) do
+  if vim.api.nvim_buf_is_valid(b) then
+    vim.api.nvim_buf_delete(b, { force = true })
+  end
+end
+check("comments: block completed", comments_ok, tostring(comments_err))
+
+---------------------------------------------------------------------------
 
 helpers.finish()

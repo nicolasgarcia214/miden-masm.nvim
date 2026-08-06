@@ -20,6 +20,7 @@ local check = helpers.check
 local util = require("masm.util")
 local project = require("masm.project")
 local goto_mod = require("masm.goto")
+local project_scan = require("masm.scan")
 local stack = require("masm.stack")
 
 local uv = vim.uv or vim.loop
@@ -355,7 +356,7 @@ local run_ok, run_err = pcall(function()
   -- Shrink the scan slice so the fixture project needs many slices; without
   -- this the whole scan finishes inside its first 10ms slice and the
   -- cancellation paths are unreachable.
-  goto_mod._scan_slice_ms = 0.05
+  project_scan._slice_ms = 0.05
 
   -- Async scan A (const MAX_VALUE), immediately preempted by async scan B
   -- (proc add_checked): exactly B's result set lands, A's never does.
@@ -469,7 +470,7 @@ local run_ok, run_err = pcall(function()
     vim.cmd("edit!") -- discard the mid-scan edit for later suites
   end)
   vim.cmd("cclose")
-  goto_mod._scan_slice_ms = nil
+  project_scan._slice_ms = nil
 
   -------------------------------------------------------------------------
   -- stack simulator budgets: MAX_SIM_OPS and MAX_CELLS
@@ -547,7 +548,7 @@ end)
 for _, d in ipairs(tmp_dirs) do
   vim.fn.delete(d, "rf")
 end
-goto_mod._scan_slice_ms = nil
+project_scan._slice_ms = nil
 project._max_scan_entries = nil
 if not run_ok then
   print("FAIL (error): " .. tostring(run_err))

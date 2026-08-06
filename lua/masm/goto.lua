@@ -20,15 +20,14 @@
 local util = require("masm.util")
 local project = require("masm.project")
 local resolve = require("masm.resolve")
+local project_scan = require("masm.scan")
 
 local M = {}
 
-local uv = util.uv
 local split_path = util.split_path
 local strip_pub = util.strip_pub
 local code_only = util.code_only
 local code_text = util.code_text
-local read_file = util.read_file
 
 function M.clear_cache()
   project.clear_cache()
@@ -386,25 +385,6 @@ end
 ---@field def_name string? definition-site name (symbols only)
 ---@field kw string? defining keyword ("proc"/"const"/"type"; symbols only)
 
--- Text for a scanned file: the live buffer when one is loaded (unsaved
--- edits must win everywhere -- for rename they MUST, or collected positions
--- would not match the buffer the edit lands in), disk otherwise. When
--- `ticks` is given, the changedtick of every buffer read is recorded in it
--- at the moment of the read -- the async references scan uses this to
--- detect buffers edited under an in-flight scan (see scan_stale).
----@param f string
----@param ticks table<integer, integer>?
-local function file_text(f, ticks)
-  local bufnr = util.loaded_bufnr(f)
-  if bufnr then
-    if ticks then
-      ticks[bufnr] = vim.api.nvim_buf_get_changedtick(bufnr)
-    end
-    return table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
-  end
-  return read_file(f)
-end
-
 -- Resolves the cursor to a scan target: the ground-truth definition plus
 -- what a project scan needs to recognize it. Returns
 -- { is_symbol, def_path, def_lnum, def_name, kw } or nil and a reason.
@@ -429,7 +409,7 @@ local function reference_target(index, buftext, bufpath)
     -- for a modified loaded buffer); the def line must come from the same
     -- source, or unsaved edits above it would silently make the scan
     -- describe whatever symbol sits on that disk line instead.
-    local def_text = (target.def_path == bufpath and buftext) or file_text(target.def_path) or ""
+    local def_text = (target.def_path == bufpath and buftext) or project_scan.file_text(target.def_path) or ""
     local def_line = vim.split(def_text, "\n")[target.def_lnum] or ""
     target.kw, target.def_name = strip_pub(def_line):match("^(%a+)%s+(" .. util.IDENT .. ")")
     if not target.def_name then
@@ -437,86 +417,6 @@ local function reference_target(index, buftext, bufpath)
     end
   end
   return target
-end
-
--- Cooperative scan driver. A references() scan visits every indexed file;
--- on a large project (or a miden-vm extra_root) that is hundreds of files,
--- and doing it in one go would freeze the UI thread for its duration.
--- Instead the scan runs in time slices and yields to the event loop between
--- them; `sync = true` (tests, rename) runs to completion in one call.
--- Starting a new scan cancels the one in flight.
-local active_scan
-local SCAN_SLICE_MS = 10
--- How many times a completed async scan is redone from scratch when a
--- buffer it read was edited mid-flight. One restart handles the realistic
--- case (the user typed while a big scan ran); the bound only guarantees a
--- pathological editing loop terminates in a warning instead of scanning
--- forever.
-local MAX_SCAN_RESTARTS = 3
-
--- Test hook (see stackview's `_diag_ns` convention): the slice length is
--- otherwise an unreachable local, and the fixture project scans in well under
--- one 10ms slice, which would make the in-flight-cancellation path untestable.
--- tests/hardening_test.lua shrinks it so a scan needs several slices; nil
--- (always, outside tests) means SCAN_SLICE_MS.
-M._scan_slice_ms = nil
-
-local function run_scan(scan)
-  local deadline = scan.sync and math.huge
-    or (uv.hrtime() + (M._scan_slice_ms or SCAN_SLICE_MS) * 1e6)
-  while scan.i <= #scan.files do
-    if uv.hrtime() > deadline then
-      vim.schedule(function()
-        if not scan.cancelled then
-          run_scan(scan)
-        end
-      end)
-      return
-    end
-    local f = scan.files[scan.i]
-    scan.i = scan.i + 1
-    local text = file_text(f, scan.ticks)
-    if text then
-      -- One unreadable or pathological file must not kill the whole scan.
-      if not pcall(scan.visit, f, text) then
-        scan.errors = scan.errors + 1
-      end
-    end
-  end
-  if scan == active_scan then
-    active_scan = nil
-  end
-  scan.on_done()
-end
-
-local function start_scan(scan)
-  -- Cancel and forget any scan in flight: leaving `active_scan` pointing at
-  -- a cancelled scan (as a sync preemption otherwise would) makes the next
-  -- start_scan "cancel" a corpse.
-  if active_scan then
-    active_scan.cancelled = true
-    active_scan = nil
-  end
-  if not scan.sync then
-    active_scan = scan
-  end
-  scan.i = 1
-  scan.errors = 0
-  scan.ticks = {}
-  run_scan(scan)
-end
-
--- Whether any buffer the scan read was edited (or wiped) after the read.
--- Collected positions describe the text at read time; an async scan yields
--- to the event loop between slices, so user edits can shift lines under
--- items already collected -- a stale scan's results must not be published.
-local function scan_stale(scan)
-  for bufnr, tick in pairs(scan.ticks) do
-    if not vim.api.nvim_buf_is_valid(bufnr) or vim.api.nvim_buf_get_changedtick(bufnr) ~= tick then
-      return true
-    end
-  end
-  return false
 end
 
 -- Re-verifies that the target's definition line still declares its name --
@@ -528,7 +428,7 @@ local function target_current(target)
   if not target.is_symbol then
     return true
   end
-  local def_line = vim.split(file_text(target.def_path) or "", "\n")[target.def_lnum] or ""
+  local def_line = vim.split(project_scan.file_text(target.def_path) or "", "\n")[target.def_lnum] or ""
   return strip_pub(def_line):match("^%a+%s+(" .. util.IDENT .. ")") == target.def_name
 end
 
@@ -598,17 +498,18 @@ function M.references(opts)
       -- was edited before completion, redo the whole scan (fresh reads see
       -- the new text) rather than publish a mix of pre- and post-edit
       -- positions. Bounded; gives up loudly, never silently wrong.
-      if not scan.sync and scan_stale(scan) then
-        scan.restarts = (scan.restarts or 0) + 1
-        if scan.restarts <= MAX_SCAN_RESTARTS and target_current(target) then
-          items, seen = {}, {}
-          start_scan(scan)
-          return
+      local stale, restarted = project_scan.restart_stale(scan, function()
+        items, seen = {}, {}
+      end, function()
+        return target_current(target)
+      end)
+      if stale then
+        if not restarted then
+          vim.notify("masm references: buffers changed while scanning; rerun", vim.log.levels.WARN)
         end
-        vim.notify("masm references: buffers changed while scanning; rerun", vim.log.levels.WARN)
         return
       end
-      if scan.errors > 0 then
+      if (scan.errors or 0) > 0 then
         vim.notify(
           "masm references: failed to scan " .. scan.errors .. " file(s)",
           vim.log.levels.WARN
@@ -625,7 +526,7 @@ function M.references(opts)
       vim.cmd("botright copen")
     end,
   }
-  start_scan(scan)
+  project_scan.start(scan)
   if opts.sync then
     return #items > 0 and items or nil
   end
@@ -762,8 +663,8 @@ local function apply_rename(bufpath, target, new_name)
     end,
     on_done = function() end,
   }
-  start_scan(scan)
-  if scan.errors > 0 then
+  project_scan.start(scan)
+  if (scan.errors or 0) > 0 then
     vim.notify(
       "masm rename: aborted, failed to scan " .. scan.errors .. " file(s)",
       vim.log.levels.ERROR

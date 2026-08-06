@@ -45,9 +45,9 @@ vim.api.nvim_create_autocmd("ColorScheme", {
   callback = define_highlights,
 })
 
--- Buffers larger than this are never analyzed (same philosophy as goto's
--- MAX_FILE_BYTES: no real .masm file approaches it).
-local MAX_BUF_BYTES = 2 * 1024 * 1024
+-- No real .masm file approaches the hardened file-read cap. Reuse the same
+-- bound for live buffers so disk and buffer analysis refuse identical input.
+local MAX_BUF_BYTES = util.MAX_FILE_BYTES
 
 -- Per-buffer state:
 -- { timer, overlay (bool), notified (string), analyzed_tick (changedtick at
@@ -328,6 +328,105 @@ function M.refresh(bufnr)
   state.analyzed_tick = tick
   state.analyzed_cfg = cfg
   state.notified = nil -- recovered: the next failure (even a repeat) notifies
+end
+
+-- Finds inaccurate handwritten operand-stack comments across every file in
+-- the current project index. The scan is asynchronous by default and shares
+-- the cooperative driver/cancellation semantics used by project references;
+-- sync mode exists for tests and callers that explicitly accept blocking.
+---@param opts {sync: boolean?}?
+---@return {filename: string, lnum: integer, col: integer, type: string, text: string}[]? items
+function M.comments(opts)
+  opts = opts or {}
+  local bufpath = vim.api.nvim_buf_get_name(0)
+  if bufpath == "" then
+    vim.notify("masm stack comments: unnamed buffer", vim.log.levels.WARN)
+    return
+  end
+
+  local ok, index = pcall(require("masm.project").build_index, bufpath)
+  if not ok then
+    vim.notify("masm stack comments: indexing failed: " .. tostring(index), vim.log.levels.ERROR)
+    return
+  end
+
+  local scanner = require("masm.scan")
+  local items = {}
+  local scan
+  scan = {
+    files = index.masm,
+    sync = opts.sync,
+    visit = function(path, text)
+      if #text > MAX_BUF_BYTES then
+        error("file exceeds analysis size limit")
+      end
+      local result, reason = stack.analyze_lines(vim.split(text, "\n", { plain = true }), path)
+      if not result then
+        error(reason or "analysis failed")
+      end
+      for _, diagnostic in ipairs(result.diagnostics) do
+        if diagnostic.code == "comment-stale" or diagnostic.code == "comment-reordered" then
+          items[#items + 1] = {
+            filename = path,
+            lnum = diagnostic.lnum,
+            col = (diagnostic.col or 0) + 1,
+            type = "W",
+            text = ("[%s] %s"):format(diagnostic.code, diagnostic.message),
+          }
+        end
+      end
+    end,
+    on_done = function()
+      local stale, restarted = scanner.restart_stale(scan, function()
+        items = {}
+      end)
+      if stale then
+        if not restarted then
+          vim.notify(
+            "masm stack comments: buffers changed while scanning; rerun",
+            vim.log.levels.WARN
+          )
+        end
+        return
+      end
+
+      table.sort(items, function(a, b)
+        if a.filename ~= b.filename then
+          return a.filename < b.filename
+        end
+        if a.lnum ~= b.lnum then
+          return a.lnum < b.lnum
+        end
+        if a.col ~= b.col then
+          return a.col < b.col
+        end
+        return a.text < b.text
+      end)
+      vim.fn.setqflist({}, " ", { title = "MASM inaccurate stack comments", items = items })
+      if (scan.errors or 0) > 0 then
+        vim.notify(
+          ("masm stack comments: failed to analyze %d file(s); results are partial"):format(
+            scan.errors
+          ),
+          vim.log.levels.WARN
+        )
+      end
+      if #items == 0 then
+        if (scan.errors or 0) == 0 then
+          vim.notify(
+            "masm stack comments: all indexed stack comments are accurate",
+            vim.log.levels.INFO
+          )
+        end
+        return
+      end
+      vim.cmd("botright copen")
+    end,
+  }
+  scanner.start(scan)
+  if opts.sync then
+    return #items > 0 and items or nil
+  end
 end
 
 ---@param bufnr integer

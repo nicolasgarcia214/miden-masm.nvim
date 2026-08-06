@@ -106,6 +106,9 @@ if not vim.g.masm_no_stack then
   vim.api.nvim_buf_create_user_command(0, "MasmStackToggle", function()
     require("masm.stackview").toggle(0)
   end, { desc = "Toggle the inferred-stack ghost-text overlay" })
+  vim.api.nvim_buf_create_user_command(0, "MasmStackComments", function()
+    require("masm.stackview").comments()
+  end, { desc = "List inaccurate stack comments project-wide" })
 end
 
 -- Let `:setfiletype` teardown undo everything we set above. `silent!`
@@ -137,6 +140,7 @@ if not vim.g.masm_no_stack then
   undo = undo
     .. " | silent! call v:lua.require'masm.stackview'.detach()"
     .. " | silent! delcommand -buffer MasmStackToggle"
+    .. " | silent! delcommand -buffer MasmStackComments"
 end
 local base = vim.b.undo_ftplugin
 vim.b.undo_ftplugin = (base and base ~= "" and base .. " | " or "") .. undo
